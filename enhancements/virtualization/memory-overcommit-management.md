@@ -91,10 +91,10 @@ This enhancement implements layered defense to enable overcommit while AVOIDING 
 3. **KSM Zero Pages**: Guest-agnostic deduplication of zero-filled pages across VMs (no guest driver required, reduces total memory footprint)
 4. **Memory Overcommit Percentage**: Reduces pod memory requests to enable statistical multiplexing
 
-**Targeted Eviction and Thrashing Prevention** (graceful degradation when unavoidable):
-5. **MGLRU (Multi-Generational LRU)**: Intelligent page replacement that targets cold pages for eviction while protecting hot pages, with Bloom filter-based thrashing prevention and per-VM tracking
+**Swap as Safety Net** (graceful degradation when unavoidable):
+5. **MGLRU-based Swap**: Modern multi-generational LRU provides intelligent swap when proactive mechanisms cannot prevent memory pressure. Targets cold pages for eviction while protecting hot pages, with Bloom filter thrashing prevention and per-VM tracking.
 
-**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. MGLRU ensures graceful degradation (not OOM kills) in worst-case scenarios through targeted eviction of truly cold pages.
+**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. When memory pressure cannot be avoided, MGLRU-based swap ensures graceful degradation (not OOM kills) through targeted eviction of truly cold pages.
 
 **Related Components**:
 - virt-platform-autopilot: Tunes all mechanisms to minimize swap traffic
