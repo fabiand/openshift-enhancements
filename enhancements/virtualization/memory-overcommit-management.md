@@ -2,24 +2,25 @@
 title: memory-overcommit-management
 authors:
   - "@fdeutsch"
-reviewers: # Include a comment about what domain expertise a reviewer is expected to bring and what area of the enhancement you expect them to focus on. For example: - "@networkguru, for networking aspects, please look at IP bootstrapping aspect"
+reviewers:
   - TBD # Virtualization team lead
   - TBD # Memory management SME
   - TBD # Performance team
-approvers: # This should be a single approver. The role of the approver is to raise important questions, ensure the enhancement receives reviews from all applicable areas/SMEs, and determine when consensus is achieved such that the EP can move forward to implementation.
+approvers:
   - TBD # CNV/Virtualization approver
-api-approvers: # In case of new or modified APIs or API extensions (CRDs, aggregated apiservers, webhooks, finalizers). If there is no API change, use "None"
-  - TBD # For VirtualMachine API changes
+api-approvers:
+  - None # Uses existing HyperConverged CR
 creation-date: 2026-11-02
 last-updated: 2026-11-02
-status: provisional
-tracking-link: # link to the tracking ticket (for example: Jira Feature or Epic ticket) that corresponds to this enhancement
+status: implemented
+tracking-link:
   - TBD
 see-also:
   - "/enhancements/scheduling/load-aware-vm-rebalancing-through-descheduler.md"
-  - "virt-platform-autopilot component (swap device automation)"
 replaces:
   - "WASP (deprecated swap mechanism)"
+  - "Legacy LRU page reclaim"
+  - "Traditional balloon inflation"
 superseded-by:
   - N/A
 ---
@@ -28,351 +29,215 @@ superseded-by:
 
 ## Summary
 
-This enhancement proposes adding memory overcommit capabilities to OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory would traditionally allow. The primary mechanism is **swap-based overcommit** leveraging Kubernetes 1.35+ swap support, complemented by memory ballooning, KSM (Kernel Samepage Merging), and configurable memory guarantees to optimize resource utilization while maintaining workload performance and stability.
+This enhancement implemented memory overcommit capabilities for OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory through statistical multiplexing. The implementation uses defense-in-depth mechanisms to AVOID swap traffic while keeping swap available as a safety net.
 
-This enhancement deprecates WASP (legacy swap mechanism) in favor of upstream Kubernetes swap support, with virt-platform-autopilot providing automation for swap configuration and management.
+Primary mechanisms work proactively to prevent swapping:
+- **Free Page Reporting (FPR)**: Asynchronous reclamation of unused pages
+- **Descheduler with PSI**: Live-migrates VMs before memory pressure causes swapping
+- **MGLRU**: Modern swap with thrashing prevention (when swap unavoidable)
+- **KSM Zero Pages**: Deduplicates zero-filled pages across VMs
+
+The virtualization-platform-autopilot component automates configuration to minimize swap usage while maintaining the safety net for worst-case scenarios.
 
 ## Motivation
 
-Virtual machine workloads often have significant gaps between allocated memory and actively used memory. Currently, OpenShift Virtualization schedules VMs based on their full memory allocation, leading to underutilization of cluster memory resources. By enabling controlled memory overcommit, administrators can:
+Operational data showed VMs typically utilize only ~20% of allocated RAM, leading to significant memory waste. Traditional 1:1 memory allocation prevented maximizing cluster density. 
 
-- Increase VM density on existing hardware
-- Reduce infrastructure costs by running more VMs per node
-- Better align memory allocation with actual usage patterns
-- Provide flexible memory management strategies for different workload types
+This enhancement enables statistical multiplexing - running more VMs by betting they won't all peak simultaneously. The key insight: **swap exists as a safety net, but all mechanisms work to AVOID actually swapping**. FPR proactively reclaims unused memory, descheduler rebalances before pressure builds, and MGLRU prevents thrashing if swapping becomes unavoidable. The goal is overcommit WITHOUT swap traffic under normal operation.
 
 ### User Stories
 
-* As a cluster administrator, I want to enable memory overcommit on my virtualization cluster, so that I can run more VMs on the same hardware without compromising stability.
+* As a cluster administrator, I want to enable memory overcommit to increase VM density on existing hardware without purchasing additional nodes.
 
-* As a platform engineer, I want to configure different memory overcommit ratios for different node pools, so that I can optimize resource utilization based on workload characteristics (e.g., higher overcommit for development environments, conservative ratios for production).
+* As a platform engineer, I want memory overcommit configuration automated so that MGLRU parameters, descheduler thresholds, and safety limits are calculated based on my cluster's characteristics rather than requiring manual tuning.
 
-* As a VM operator, I want to specify memory guarantees for critical VMs, so that they receive dedicated physical memory while allowing non-critical VMs to share remaining resources.
+* As a VM operator, I want transparent memory management so VMs can report unused pages to the hypervisor without experiencing performance degradation from forced balloon inflation.
 
-* As a cluster administrator, I want to monitor actual memory usage versus allocated memory across all VMs, so that I can make informed decisions about overcommit ratios and capacity planning.
+* As a cluster administrator, I want safe KSM that only merges zero-filled pages so I get memory deduplication benefits without the security and performance concerns of full KSM.
 
-* As a VM operator, I want transparent memory ballooning in my VMs, so that the platform can reclaim unused memory without manual intervention or VM restarts.
+* As a cluster administrator, I want the descheduler to rebalance VMs based on actual memory pressure (PSI metrics) so live migration prevents node saturation before emergency evictions occur.
 
-* As a cluster administrator, I want KSM to automatically deduplicate identical memory pages across VMs, so that I can increase density for workloads running similar operating systems or applications.
+* As an SRE, I want observability into memory overcommit ratios, swap usage, and pressure stall metrics so I can make informed capacity planning decisions.
 
 ### Goals
 
-- Enable swap-based memory overcommit using Kubernetes 1.35+ swap support
-- Configure swap devices and policies for VM workloads
-- Implement memory ballooning support for guest VMs with balloon driver
-- Integrate KSM (Kernel Samepage Merging) for transparent memory deduplication
-- Provide memory guarantee mechanisms for critical workloads
-- Add observability metrics for memory overcommit, swap usage, and utilization
-- Ensure safe defaults that prevent node memory pressure
-- Support smooth migration between overcommit configurations
-- Deprecate WASP in favor of Kubernetes swap
-- Integration with virt-platform-autopilot for automated swap provisioning
+- Enable configurable memory overcommit ratios via HyperConverged CR
+- Implement Free Page Reporting (FPR) as default asynchronous memory reclamation
+- Integrate MGLRU (Multi-Generational LRU) for modern swap with per-VM tracking
+- Provide KSM zero-page merging for safe memory deduplication
+- Add virtualization-platform-autopilot for automated configuration
+- Integrate descheduler with PSI metrics for pressure-based rebalancing
+- Deprecate WASP, legacy LRU, and traditional balloon inflation
+- Ensure safe defaults (0% overcommit unless explicitly enabled)
 
 ### Non-Goals
 
-- Automatic live migration based on memory pressure (handled separately by descheduler)
+- Automatic live migration based on memory pressure (handled by descheduler, not this enhancement)
 - Cross-node memory sharing or distributed memory management
-- Memory compression (may be addressed in future enhancement)
-- Modifying Kubernetes pod memory management (focuses on VMs only)
-- Single-Node OpenShift (SNO) support - deferred to future enhancement due to unique stability requirements
-- WASP (legacy swap mechanism) - deprecated in favor of Kubernetes swap support
+- Memory compression (zswap/zram)
+- Modifying Kubernetes pod memory management for non-VM workloads
+- Single-Node OpenShift (SNO) support - deferred due to control plane stability requirements
+- Full KSM (arbitrary page merging) - security and performance concerns
 
 ## Proposal
 
-This enhancement introduces four complementary mechanisms for memory overcommit:
+This enhancement implements layered defense to enable overcommit while AVOIDING swap traffic:
 
-1. **Swap-based Overcommit**: Leverage Kubernetes 1.35+ swap support to allow memory pages to be swapped to disk (primary mechanism)
-2. **Memory Ballooning**: Guest VMs run a balloon driver that can dynamically inflate/deflate based on host memory pressure
-3. **KSM (Kernel Samepage Merging)**: Kernel-level deduplication of identical memory pages across VMs
-4. **Memory Guarantees**: API to specify minimum guaranteed physical memory per VM
+**Proactive Mechanisms** (prevent swapping):
+1. **Free Page Reporting (FPR)**: Asynchronous reporting of unused pages from guest to hypervisor (primary reclamation, enabled by default)
+2. **Descheduler with PSI**: Live-migrates VMs when pressure detected, BEFORE swapping starts
+3. **KSM Zero Pages**: Deduplicates zero-filled pages across VMs, reducing total memory footprint
 
-**Related Component**: virt-platform-autopilot automates swap device provisioning and configuration.
+**Safety Net** (when swap unavoidable):
+4. **MGLRU (Multi-Generational LRU)**: Modern swap with Bloom filter thrashing prevention and per-VM tracking
+5. **Memory Overcommit Percentage**: Reduces pod memory requests to enable statistical multiplexing
+
+**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. MGLRU ensures graceful degradation (not OOM kills) in worst-case scenarios.
+
+**Related Components**:
+- virtualization-platform-autopilot: Tunes all mechanisms to minimize swap traffic
+- Descheduler (KubeVirtRelieveAndMigrate): Uses PSI metrics to detect pressure early and rebalance
 
 ### Workflow Description
 
-**cluster administrator** is responsible for configuring cluster-wide memory overcommit policies.
+**cluster administrator** configures memory overcommit settings.
 
-**VM operator** is responsible for creating and configuring individual VMs with appropriate memory settings.
+**virtualization-platform-autopilot** calculates optimal parameters.
 
-**node** is a worker node running RHCOS with KubeVirt/virt-launcher pods.
+**descheduler** monitors pressure and rebalances VMs.
 
 #### Enabling Memory Overcommit (Admin Workflow)
 
-1. The cluster administrator reviews current cluster memory utilization and workload patterns
-2. The administrator creates a `MemoryOvercommitConfig` CR at cluster scope specifying:
-   - Target overcommit ratio (e.g., 1.5x = 50% overcommit)
-   - KSM enablement and scanning parameters
-   - Safety thresholds for node memory pressure
-3. The virt-controller observes the configuration and updates node-level settings:
-   - Enables KSM on worker nodes via MachineConfig
-   - Configures virt-launcher to support memory ballooning
-   - Adjusts scheduler to account for overcommit ratio
-4. The administrator monitors new metrics:
-   - `kubevirt_memory_overcommit_ratio_current`
-   - `kubevirt_memory_ksm_pages_shared`
-   - `kubevirt_memory_balloon_actual_bytes`
-
-#### Creating VMs with Memory Guarantees (VM Operator Workflow)
-
-1. The VM operator defines a VirtualMachine CR with memory settings:
-   ```yaml
-   spec:
-     template:
-       spec:
-         domain:
-           memory:
-             guest: 8Gi          # Allocated memory visible to guest
-             guaranteed: 4Gi     # Minimum physical memory guarantee
+1. Administrator enables autopilot on HyperConverged resource:
+   ```bash
+   oc annotate hyperconverged kubevirt-hyperconverged \
+     -n openshift-cnv platform.kubevirt.io/autopilot="true" --overwrite
    ```
-2. When the VM is scheduled:
-   - Scheduler considers `guaranteed` memory for node placement
-   - virt-launcher requests `guaranteed` memory from kubelet
-   - Guest OS sees full `guest` memory allocation
-3. At runtime:
-   - If host memory pressure occurs, balloon driver reclaims memory above guarantee
-   - KSM may deduplicate pages across VMs
-   - VM continues running as long as `guaranteed` memory is available
 
-#### Memory Reclamation Under Pressure
+2. Autopilot calculates and applies:
+   - MGLRU parameters (based on node memory, workload patterns)
+   - Memory overcommit percentage (default 20% at node level)
+   - Descheduler thresholds for pressure-based rebalancing
+   - Control group throttling limits
 
-1. Node memory utilization exceeds configured threshold (e.g., 85%)
-2. virt-handler detects pressure via cgroup memory statistics
-3. For VMs with ballooning enabled and usage above guarantee:
-   - virt-handler sends balloon inflation request to guest driver
-   - Guest balloon driver allocates memory internally, making it reclaimable
-   - Host kernel reclaims ballooned memory for other workloads
-4. If pressure continues to increase:
-   - VMs with no guarantee may be evicted (existing pod eviction mechanism)
-   - VMs with guarantees remain running with guaranteed allocation
+3. Administrator optionally configures custom overcommit percentage:
+   ```bash
+   oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+     --type='merge' -p='{"spec":{"virtualization":{"memoryOvercommitPercentage":150}}}'
+   ```
 
-#### Disabling Memory Overcommit
+4. VMs automatically benefit from FPR (enabled by default):
+   - Guest OS reports free pages via virtio driver
+   - Hypervisor reclaims pages asynchronously
+   - No forced balloon inflation (unlike traditional ballooning)
 
-1. The administrator updates `MemoryOvercommitConfig` to disable overcommit
-2. Controller updates scheduler to stop considering overcommit ratio
-3. New VMs are scheduled with full memory allocation
-4. Existing VMs continue running but may be migrated if node becomes overcommitted
-5. KSM can be independently disabled via separate setting
+#### Enabling KSM Zero Pages (Optional)
+
+1. Administrator enables KSM zero-page merging:
+   ```bash
+   oc annotate hyperconverged kubevirt-hyperconverged \
+     -n openshift-cnv platform.kubevirt.io/enable-ksm-zero-only="true" --overwrite
+   ```
+
+2. Host kernel merges zero-filled pages across VMs:
+   - Guest-agnostic (no guest driver required)
+   - Secure (only zero-filled pages, not arbitrary application data)
+   - Common in Windows workloads
+
+#### Memory Pressure Response (Avoids Swapping)
+
+**Normal operation** (no pressure):
+1. FPR continuously reports unused pages → hypervisor reclaims
+2. KSM merges zero pages across VMs → reduces footprint
+3. Result: Overcommit achieved WITHOUT swap traffic
+
+**Moderate pressure** (70-80% utilization):
+1. Descheduler monitors utilization metrics
+2. If trending upward: Live-migrate VMs to less-utilized nodes
+3. Rebalancing prevents pressure from building
+4. Result: Swap still NOT used
+
+**High pressure** (>80% utilization):
+1. Descheduler switches to PSI (Pressure Stall Information) metrics
+2. PSI detects when workloads START waiting for memory operations
+3. Aggressive live-migration from saturated nodes
+4. Soft-taint saturated nodes (PreferNoSchedule)
+5. Result: Swap minimally used or avoided entirely
+
+**Worst-case** (rebalancing cannot keep up):
+1. MGLRU tiers cold pages to swap (graceful degradation)
+2. Bloom filters prevent thrashing
+3. Swap traffic occurs but VM stays running (not OOM killed)
+4. Alerting triggers for operator intervention
+
+**Goal**: Steps 1-3 should handle 99% of cases. Swap is safety net for step 4.
 
 ### API Extensions
 
-This enhancement modifies the `VirtualMachine` API and adds a new cluster-scoped configuration API.
+No new CRDs. Uses existing HyperConverged CR from openshift-cnv operator.
 
-#### New API: MemoryOvercommitConfig (Cluster-scoped)
+#### Modified API: HyperConverged
 
-```go
-// MemoryOvercommitConfig configures cluster-wide memory overcommit behavior
-// +genclient
-// +genclient:nonNamespaced
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-type MemoryOvercommitConfig struct {
-    metav1.TypeMeta   `json:",inline"`
-    metav1.ObjectMeta `json:"metadata,omitempty"`
+```yaml
+apiVersion: hco.kubevirt.io/v1beta1
+kind: HyperConverged
+metadata:
+  name: kubevirt-hyperconverged
+  namespace: openshift-cnv
+  annotations:
+    # Enable autopilot for automated configuration
+    platform.kubevirt.io/autopilot: "true"
+    # Enable KSM zero-page merging
+    platform.kubevirt.io/enable-ksm-zero-only: "true"
+spec:
+  virtualization:
+    # Memory overcommit percentage (optional)
+    # Formula: pod requests = VM guest * 100 / memoryOvercommitPercentage
+    # Example: 150 means 12Gi VM requests 8Gi (12 * 100 / 150)
+    # Default: 100 (no overcommit unless explicitly set)
+    memoryOvercommitPercentage: 150
     
-    Spec   MemoryOvercommitConfigSpec   `json:"spec"`
-    Status MemoryOvercommitConfigStatus `json:"status"`
-}
-
-type MemoryOvercommitConfigSpec struct {
-    // OvercommitRatio is the target ratio of allocated to physical memory.
-    // For example, 1.5 means 50% overcommit (can allocate 1.5x physical memory).
-    // Valid range: 1.0 (no overcommit) to 4.0 (300% overcommit).
-    // Default: 1.0 (no overcommit, subject to change in future releases)
-    // +optional
-    // +kubebuilder:validation:Minimum=1.0
-    // +kubebuilder:validation:Maximum=4.0
-    OvercommitRatio *float64 `json:"overcommitRatio,omitempty"`
-    
-    // Swap configures swap-based memory overcommit
-    // +optional
-    Swap *SwapConfig `json:"swap,omitempty"`
-    
-    // KSM configures Kernel Samepage Merging for memory deduplication
-    // +optional
-    KSM *KSMConfig `json:"ksm,omitempty"`
-    
-    // NodeSelector applies this configuration only to matching nodes.
-    // If empty, applies to all virtualization-capable multi-node clusters.
-    // Single-Node OpenShift (SNO) nodes are automatically excluded.
-    // +optional
-    NodeSelector map[string]string `json:"nodeSelector,omitempty"`
-    
-    // SafetyThresholds defines when to stop accepting new VMs
-    // +optional
-    SafetyThresholds *SafetyThresholds `json:"safetyThresholds,omitempty"`
-}
-
-type SwapConfig struct {
-    // Enabled controls whether swap is configured on matching nodes
-    // Requires virt-platform-autopilot for automated provisioning
-    // +optional
-    Enabled bool `json:"enabled"`
-    
-    // SwapSizeMultiplier determines swap device size as multiple of node RAM
-    // For example, 2.0 means swap size = 2x node physical memory
-    // Default: 2.0
-    // +optional
-    // +kubebuilder:validation:Minimum=0.5
-    // +kubebuilder:validation:Maximum=4.0
-    SwapSizeMultiplier *float64 `json:"swapSizeMultiplier,omitempty"`
-    
-    // DefaultSwapBehavior for VMs without explicit swapBehavior setting
-    // UnlimitedSwap: VM can use all available swap
-    // LimitedSwap: VM swap limited to memorySwap.swapLimitBytes
-    // NoSwap: VM cannot use swap
-    // Default: UnlimitedSwap
-    // +optional
-    // +kubebuilder:validation:Enum=UnlimitedSwap;LimitedSwap;NoSwap
-    DefaultSwapBehavior *string `json:"defaultSwapBehavior,omitempty"`
-}
-
-type KSMConfig struct {
-    // Enabled controls whether KSM is active on matching nodes
-    // +optional
-    Enabled bool `json:"enabled"`
-    
-    // ScanInterval is how often KSM scans for duplicate pages (milliseconds)
-    // Default: 100ms
-    // +optional
-    ScanInterval *int32 `json:"scanInterval,omitempty"`
-    
-    // PagesToScan is number of pages scanned per interval
-    // Default: 100
-    // +optional
-    PagesToScan *int32 `json:"pagesToScan,omitempty"`
-}
-
-type SafetyThresholds struct {
-    // NodeMemoryPressureThreshold is the percentage of node memory usage
-    // above which new VM scheduling is paused (but existing VMs continue)
-    // Default: 85%
-    // +optional
-    // +kubebuilder:validation:Minimum=50
-    // +kubebuilder:validation:Maximum=95
-    NodeMemoryPressureThreshold *int32 `json:"nodeMemoryPressureThreshold,omitempty"`
-}
-
-type MemoryOvercommitConfigStatus struct {
-    // Conditions track the state of the configuration
-    Conditions []metav1.Condition `json:"conditions,omitempty"`
-    
-    // ObservedGeneration is the last generation reconciled
-    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-    
-    // NodesConfigured is the number of nodes with this config applied
-    NodesConfigured int32 `json:"nodesConfigured"`
-    
-    // TotalPhysicalMemory is total physical memory across configured nodes
-    TotalPhysicalMemory resource.Quantity `json:"totalPhysicalMemory"`
-    
-    // TotalAllocatableMemory considering overcommit ratio
-    TotalAllocatableMemory resource.Quantity `json:"totalAllocatableMemory"`
-}
+    # KSM configuration (alternative to annotation)
+    # Not used when autopilot enabled with KSM zero-only annotation
+    ksmConfiguration:
+      nodeLabelSelector:
+        matchLabels:
+          kubevirt.io/ksm-enabled: "true"
 ```
 
-#### Modified API: VirtualMachine Memory Spec
+**Behavior**:
 
-```go
-// Existing VirtualMachine API extended with new fields
-type Memory struct {
-    // Guest is the memory size visible to the guest OS
-    // This is the traditional memory allocation field
-    // +optional
-    Guest *resource.Quantity `json:"guest,omitempty"`
-    
-    // Guaranteed is the minimum physical memory guaranteed to this VM.
-    // Must be less than or equal to Guest.
-    // If unset, defaults to Guest value (no overcommit for this VM).
-    // When set lower than Guest, the difference may be overcommitted.
-    // +optional
-    Guaranteed *resource.Quantity `json:"guaranteed,omitempty"`
-    
-    // Ballooning configures the memory balloon device
-    // +optional
-    Ballooning *BallooningConfig `json:"ballooning,omitempty"`
-    
-    // MemorySwap configures swap behavior for this VM
-    // +optional
-    MemorySwap *MemorySwap `json:"memorySwap,omitempty"`
-}
-
-type BallooningConfig struct {
-    // Enabled controls whether balloon device is attached to VM
-    // Requires balloon driver in guest OS
-    // Default: true (subject to change, will auto-enable for overcommit)
-    // +optional
-    Enabled *bool `json:"enabled,omitempty"`
-    
-    // StatsInterval is how often balloon stats are collected (seconds)
-    // Default: 10
-    // +optional
-    StatsInterval *int32 `json:"statsInterval,omitempty"`
-}
-
-// MemorySwap configures swap behavior for a VM
-type MemorySwap struct {
-    // SwapBehavior controls how swap is used for this VM
-    // Inherits from MemoryOvercommitConfig.defaultSwapBehavior if not set
-    // +optional
-    // +kubebuilder:validation:Enum=UnlimitedSwap;LimitedSwap;NoSwap
-    SwapBehavior *string `json:"swapBehavior,omitempty"`
-    
-    // SwapLimitBytes limits swap usage for this VM
-    // Only applies when swapBehavior=LimitedSwap
-    // +optional
-    SwapLimitBytes *resource.Quantity `json:"swapLimitBytes,omitempty"`
-}
-```
-
-**API Behavior:**
-
-- MemoryOvercommitConfig is singleton resource named `cluster`
-- Scheduler multiplies node allocatable by overcommit ratio when ratio > 1.0
-- `guaranteed` field sets virt-launcher pod memory request
-- Finalizer ensures cleanup on VM deletion
+- **autopilot annotation**: Enables virtualization-platform-autopilot to configure MGLRU, descheduler, limits
+- **memoryOvercommitPercentage**: Reduces pod requests; scheduler can pack more VMs per node
+- **FPR**: Enabled by default for all VMs (no configuration needed)
+- **KSM zero-only**: Merges zero-filled pages; guest-agnostic, secure
 
 ### Topology Considerations
 
 #### Hypershift / Hosted Control Planes
 
-**Impact**: Moderate - virt components run in guest cluster, but configuration affects both clusters.
+Memory overcommit applies to guest cluster worker nodes only:
 
-**Guest cluster**:
-- VirtualMachine CRs and virt-launcher pods run here
-- Memory overcommit applies to guest cluster worker nodes
-- KSM runs on guest cluster worker nodes (not in HCP namespace)
-- Metrics exposed in guest cluster Prometheus
+- VirtualMachine CRs run in guest cluster
+- HyperConverged CR configured in guest cluster
+- FPR, MGLRU, KSM operate on guest worker nodes
+- Management cluster HCP pods unaffected
 
-**Management cluster**:
-- No direct impact to management cluster memory
-- HCP control plane pods have fixed memory (not affected by guest VM overcommit)
-- Guest cluster node resources are independent of HCP resource accounting
-
-**Version skew considerations**:
-- Guest cluster CNV version determines feature availability
-- Management cluster version does not gate this feature
-- API changes follow standard CNV upgrade path in guest cluster
-
-**Configuration**:
-- `MemoryOvercommitConfig` CR lives in guest cluster (same as VirtualMachine CRs)
-- MachineConfig for KSM targets guest cluster worker nodes
-
-**Why this is HCP-specific**: In standalone clusters, enabling KSM affects control plane nodes if they're schedulable. In HCP, control plane runs as pods in management cluster and is unaffected by guest cluster KSM settings.
+Autopilot runs in guest cluster and configures guest worker nodes. No cross-cluster dependencies.
 
 #### Standalone Clusters
 
-**Impact**: Standard - applies to all worker nodes (and master nodes if schedulable).
-
-This is the primary deployment model for the feature. Memory overcommit affects:
-- Worker nodes running virt-launcher pods
-- Master nodes if they're schedulable and running VMs (rare but possible)
-
-**Configuration**: `MemoryOvercommitConfig` applies cluster-wide or via nodeSelector.
+Primary deployment model. All mechanisms supported:
+- FPR on all worker nodes
+- MGLRU for swap management
+- KSM zero pages across workers
+- Descheduler rebalances VMs across cluster
 
 #### Single-node Deployments or MicroShift
 
-**SNO**: Out of scope. SNO nodes are automatically excluded via `node.openshift.io/single-node-cluster` label. Memory overcommit risks control plane stability due to shared memory resources with no HA fallback.
+**SNO**: Out of scope. Control plane stability risk. Nodes automatically excluded.
 
-**MicroShift**: Not applicable. OpenShift Virtualization is not included in MicroShift.
+**MicroShift**: Not applicable. OpenShift Virtualization not included.
 
 #### OpenShift Kubernetes Engine
 
@@ -380,380 +245,394 @@ Not applicable. OKE does not include OpenShift Virtualization.
 
 ### Implementation Details/Notes/Constraints
 
-#### Swap-based Overcommit Implementation
+#### Free Page Reporting (FPR) Implementation
 
-**Swap Device Provisioning**:
-- virt-platform-autopilot manages LVM-based swap volumes
-- Default swap size: 2x node RAM (configurable via MemoryOvercommitConfig)
-- Swap devices provisioned per node, shared by all VMs on that node
+**Mechanism**:
+- Enabled by default (no configuration needed)
+- Guest virtio driver scans free memory lists
+- Reports free pages to hypervisor via QMP channel
+- Hypervisor returns pages to host allocation pool
+- **Asynchronous**: No forced allocation (unlike traditional ballooning)
 
-**Kubernetes Swap Integration**:
-- Leverages Kubernetes 1.35+ swap support
-- kubelet configured with `failSwapOn: false` and `memorySwap.swapBehavior`
-- Node capacity extended by swap size for scheduling calculations
+**Advantages over Traditional Ballooning**:
+- Traditional ballooning inflates balloon device inside guest, forcing allocation
+- Can cause performance degradation during sudden spikes
+- Conflicts with guest-level memory compression
+- FPR observes already-freed pages without forcing allocation
 
-**VM Swap Policies**:
-- Per-VM swap limits configurable via `spec.memorySwap.swapLimitBytes`
-- Swap behavior: UnlimitedSwap (default), LimitedSwap, or NoSwap
-- virt-launcher pod inherits swap configuration from kubelet
+**Guest Driver Requirements**:
+- Linux: virtio_balloon module (included in most distros)
+- Windows: virtio-win guest tools
 
-**Interaction with Ballooning**:
-1. Memory pressure detected
-2. Balloon inflates first (fast, in-memory reclamation)
-3. If pressure continues, kernel swaps pages to disk
-4. Both mechanisms work together: balloon for transient, swap for sustained pressure
+**Disabled When**:
+- VM uses hugepages (memory pre-allocated and pinned)
 
-**Performance**:
-- SSD/NVMe recommended for swap devices (virt-platform-autopilot validates)
-- Swap I/O slower than RAM but prevents OOM kills
-- Metrics track swap usage to detect over-subscription
+#### MGLRU (Multi-Generational LRU) Implementation
 
-#### Memory Ballooning Implementation
+**Default since OpenShift 4.18**. Replaces legacy active/inactive LRU and WASP.
 
-virt-launcher pod requests `guaranteed` memory; VM sees `guest` memory. virtio-balloon device attached. virt-handler inflates balloon when memory pressure detected via cgroup stats. Requires guest driver (virtio_balloon for Linux, virtio-win for Windows). Balloon never deflates below `guaranteed` level.
+**Generational Page Tracking**:
+- Generation 0: Hot pages (protected with Bloom filters)
+- Generation 1: Aging pages
+- Generation 2/3: Cold pages (eviction targets)
 
-#### KSM Integration
+**Per-VM Tracking**:
+- Linux cgroups track memory per virt-launcher pod
+- Accurate per-VM swap attribution
 
-MachineConfig enables KSM via `/sys/kernel/mm/ksm/run = 1`. Scanning parameters configurable via spec. KSM CPU overhead is tunable via `pagesToScan` (higher scanning = more CPU, more deduplication).
+**Thrashing Prevention**:
+- Bloom filters track recently evicted pages
+- Prevents re-swapping same pages (lower CPU overhead)
 
-#### Scheduler Changes
+**Configuration**:
+- Autopilot calculates optimal parameters based on node memory, workload
+- Manual configuration not recommended (complex parameter interactions)
 
-Multiplies node allocatable by overcommit ratio (includes swap capacity). Filters on `guaranteed` memory. Excludes SNO nodes via label. Respects safety thresholds.
+**Secondary Memory Tiers**:
+- High-performance NVMe/SSD for swap devices
+- Future: CXL (Compute Express Link) byte-addressable expansion
 
-#### Observability
+#### KSM Zero Pages Implementation
 
-New Prometheus metrics:
+**Since OpenShift 4.22**. Replaces full KSM.
 
+**Mechanism**:
+- Host kernel scans for zero-filled pages only
+- Merges identical zero pages across VMs
+- Guest-agnostic (no guest driver required)
+
+**Why Zero-Only**:
+- Full KSM security concerns: arbitrary page content exposure risk
+- Full KSM performance concerns: slows memory operations
+- Zero pages common in Windows workloads
+- Faster and less CPU-intensive than full KSM
+
+**Configuration**:
+```bash
+oc annotate hyperconverged kubevirt-hyperconverged \
+  -n openshift-cnv platform.kubevirt.io/enable-ksm-zero-only="true"
 ```
-# Cluster-level
-kubevirt_memory_overcommit_ratio{node="worker-1"} 1.5
-kubevirt_memory_physical_bytes{node="worker-1"} 68719476736
-kubevirt_memory_allocatable_bytes{node="worker-1"} 103079215104
-kubevirt_swap_total_bytes{node="worker-1"} 137438953472
-kubevirt_swap_used_bytes{node="worker-1"} 34359738368
 
-# Per-VM
-kubevirt_vm_memory_guest_bytes{vm="web-server",namespace="prod"} 8589934592
-kubevirt_vm_memory_guaranteed_bytes{vm="web-server",namespace="prod"} 4294967296
-kubevirt_vm_memory_balloon_actual_bytes{vm="web-server",namespace="prod"} 6442450944
-kubevirt_vm_swap_used_bytes{vm="web-server",namespace="prod"} 2147483648
+#### Virtualization Platform Autopilot
 
-# KSM
-kubevirt_ksm_pages_sharing{node="worker-1"} 524288
-kubevirt_ksm_cpu_seconds_total{node="worker-1"} 45.2
+**Purpose**: Automates complex configuration calculations.
+
+**Calculates and Configures**:
+- MGLRU parameters (scan rates, generation thresholds)
+- Memory overcommit hard limits (safety bounds)
+- Descheduler thresholds (when to trigger rebalancing)
+- Control group throttling limits
+
+**Activation**:
+```bash
+oc annotate hyperconverged kubevirt-hyperconverged \
+  -n openshift-cnv platform.kubevirt.io/autopilot="true"
 ```
 
-New alerts:
-
-```yaml
-- alert: MemoryOvercommitNodePressure
-  expr: kubevirt_memory_overcommit_pressure_ratio > 0.85
-  annotations:
-    summary: "Node {{ $labels.node }} approaching memory pressure threshold"
-
-- alert: VMMemoryBalloonInflationHigh
-  expr: (kubevirt_vm_memory_balloon_actual_bytes / kubevirt_vm_memory_guest_bytes) < 0.5
-  annotations:
-    summary: "VM {{ $labels.vm }} balloon inflated >50%, possible memory pressure"
-
-- alert: SwapUsageHigh
-  expr: kubevirt_swap_used_bytes / kubevirt_swap_total_bytes > 0.8
-  annotations:
-    summary: "Node {{ $labels.node }} swap usage >80%, consider adding capacity"
-
-- alert: VMSwapThrashing
-  expr: rate(kubevirt_vm_swap_in_bytes[5m]) > 10485760  # 10MB/s
-  annotations:
-    summary: "VM {{ $labels.vm }} swapping heavily, performance degraded"
+**Deactivation** (does not disable already-configured features):
+```bash
+oc annotate hyperconverged kubevirt-hyperconverged \
+  -n openshift-cnv platform.kubevirt.io/autopilot="false"
 ```
+
+#### Descheduler Integration
+
+**Strategy**: KubeVirtRelieveAndMigrate
+
+**Normal Operation** (<80% saturation):
+- Monitors real-time memory and CPU utilization metrics
+- Rebalances based on utilization thresholds
+
+**High Saturation** (>80%):
+- Switches to PSI (Pressure Stall Information) metrics
+- PSI measures "time workloads spend waiting for memory operations"
+- Live-migrates VMs from saturated to underutilized nodes
+- Applies soft taint (PreferNoSchedule) to saturated nodes
+
+**Asymmetric Deviation Thresholds**:
+- Prevents migration churn
+- Requires significant pressure delta before triggering migration
 
 ### Risks and Mitigations
 
-**Risk: Node OOM killing VMs**  
-*Mitigation*: Safety thresholds, memory guarantees, conservative defaults, OOMKiller score adjustment.
+**Risk: Node OOM despite overcommit**  
+*Mitigation*: Defense-in-depth (FPR, MGLRU, descheduler, node-pressure eviction). Autopilot sets conservative hard limits.
 
-**Risk: Missing balloon driver**  
-*Mitigation*: Detect at start, log warning, scheduler accounts for worst-case.
+**Risk: Swap thrashing degrading VM performance**  
+*Mitigation*: MGLRU Bloom filters prevent re-swapping. Descheduler migrates VMs before thrashing. PSI metrics detect thrashing early. Recommend SSD/NVMe for swap.
 
 **Risk: KSM CPU overhead**  
-*Mitigation*: Optional, disabled by default, configurable scan rates, metrics.
+*Mitigation*: KSM zero-only is faster and less CPU-intensive than full KSM. Only scans for zero pages.
 
-**Risk: Upgrade disruption**  
-*Mitigation*: Changes only affect new VMs, live migration for rebalancing.
+**Risk: Over-aggressive autopilot settings**  
+*Mitigation*: Autopilot uses conservative defaults. Manual override available via memoryOvercommitPercentage.
 
-**Risk: Cascading evictions**  
-*Mitigation*: Priority scores, PodDisruptionBudgets, gradual eviction.
+**Risk: Descheduler migration churn**  
+*Mitigation*: Asymmetric deviation thresholds. Soft taint prevents immediate re-scheduling. PSI metrics reduce false positives.
 
 ### Drawbacks
 
-Increased complexity in debugging. Performance unpredictability under memory pressure. Requires guest drivers. Additional operational concepts to understand. Incompatible with strict performance SLAs.
+Increased complexity. Swap I/O slower than RAM. Autopilot calculations opaque. Performance unpredictability under high overcommit. Incompatible with strict performance SLAs.
 
 ## Alternatives (Not Implemented)
 
-### Alternative 1: WASP (Legacy Swap Mechanism)
+### Alternative 1: WASP
 
-Not chosen. WASP is deprecated in favor of upstream Kubernetes swap support (GA in 1.35+). Kubernetes swap provides:
-- Standardized swap configuration via kubelet
-- QoS-aware swap policies
-- Better upstream integration and support
-- Per-pod swap limits
+Deprecated in favor of MGLRU. WASP was a dedicated swap component. MGLRU provides:
+- Better integration with Kubernetes cgroups
+- Per-VM tracking and accounting
+- Bloom filter thrashing prevention
+- Lower CPU overhead
 
-This enhancement uses Kubernetes swap instead of WASP.
+### Alternative 2: Traditional Balloon Inflation
 
-### Alternative 2: In-memory Only (No Swap)
+Replaced by FPR. Traditional ballooning forces allocation inside guest, causing:
+- Performance degradation during spikes
+- Latency spikes
+- Conflicts with guest memory compression
+FPR observes already-freed pages asynchronously.
 
-Not chosen. While ballooning and KSM provide some overcommit, swap provides the largest capacity gains and is more predictable than aggressive in-memory reclamation. Swap allows graceful degradation under memory pressure instead of OOM kills.
+### Alternative 3: Full KSM
 
-### Alternative 3: Memory Compression (zswap/zram)
+Replaced by KSM zero-only. Full KSM security/performance concerns:
+- Arbitrary page content exposure risk
+- Slows memory operations
+- High CPU overhead
+KSM zero-only is guest-agnostic, secure, faster.
 
-Not chosen. CPU overhead for compression/decompression. Unpredictable compression ratios. Swap to disk is more predictable. Could complement swap in future.
+### Alternative 4: Manual Configuration
 
-### Alternative 4: Automatic Memory Right-sizing
-
-Not chosen. Requires VM restart. Should be separate day-2 operations enhancement.
-
-### Alternative 5: Per-Namespace Overcommit Policies
-
-Not chosen. Scheduler complexity. ResourceQuotas already provide namespace limits. Partially achievable via nodeSelector.
+Rejected in favor of autopilot. MGLRU parameters complex and interdependent. Autopilot calculates based on cluster characteristics.
 
 ## Open Questions [optional]
 
-1. Should VirtualMachine status expose `memoryPressure` condition when balloon is inflated?
-
-2. How should `guaranteed` interact with ResourceQuotas - count guaranteed or full guest allocation?
-
-3. Default behavior when `guaranteed` not specified: default to `guest` (safe) or `guest/ratio` (aggressive)?
-
-4. Should KSM be separate CR or bundled in MemoryOvercommitConfig?
+None. Implementation completed in OpenShift 4.18-4.22.
 
 ## Test Plan
 
+Tested across OpenShift 4.17 → 4.18 (MGLRU) → 4.22 (Autopilot, KSM zero).
+
 ### Unit Tests
 
-- API validation (guaranteed <= guest, ratio ranges)
-- Scheduler logic with various overcommit ratios
-- Balloon inflation/deflation calculations
-- KSM configuration generation
+- MGLRU parameter calculation
+- Overcommit percentage application to pod requests
+- Autopilot configuration logic
 
-### Integration Tests (envtest)
+### Integration Tests
 
-- Controller reconciliation of MemoryOvercommitConfig
-- Scheduler filtering based on guaranteed memory
-- Metrics registration and updates
-- Webhook validation of API constraints
+- FPR reporting guest free pages
+- MGLRU generation transitions
+- KSM zero-page merging
+- Descheduler PSI threshold switching
 
-### E2E Tests (Full Cluster)
+### E2E Tests
 
-**Test: Basic Memory Overcommit**
-1. Enable overcommit ratio 1.5 on test cluster
+**Memory Overcommit Density**:
+1. Enable 150% overcommit
 2. Create VMs totaling 1.5x node physical memory
-3. Verify all VMs scheduled and running
-4. Verify memory metrics show overcommit
+3. Verify all scheduled and running
+4. Verify pod requests reduced per formula
 
-**Test: Memory Ballooning Under Pressure**
-1. Create VM with guest=8Gi, guaranteed=4Gi
-2. Simulate memory pressure on node (create memory-consuming pods)
-3. Verify balloon inflates in VM (actual < guest)
-4. Verify VM remains running and functional
-5. Remove pressure, verify balloon deflates
+**FPR Reclamation**:
+1. Create VM, allocate memory in guest
+2. Free memory in guest
+3. Verify FPR reports pages
+4. Verify hypervisor reclaims
 
-**Test: Memory Guarantees Honored**
-1. Create VM with guaranteed=4Gi
-2. Create memory pressure exceeding available memory
-3. Verify VM continues running with 4Gi available
-4. Verify other pods may be evicted, but VM is not
+**MGLRU Swap**:
+1. Create memory pressure
+2. Verify MGLRU tiers cold pages to swap
+3. Verify Bloom filters prevent re-swapping
+4. Monitor swap usage metrics
 
-**Test: KSM Deduplication**
-1. Enable KSM with aggressive scan settings
-2. Create 5 identical VMs (same OS image)
-3. Wait for KSM to scan and merge pages
-4. Verify `ksm_pages_sharing` metric increases
-5. Verify total physical memory usage < sum of VM allocations
+**KSM Zero Pages**:
+1. Enable KSM zero-only
+2. Create VMs with zero-filled pages
+3. Verify pages merged
+4. Verify ksm_pages_sharing metric
 
-**Test: SNO Exclusion from Overcommit**
-1. Deploy on SNO cluster
-2. Attempt to enable overcommit configuration
-3. Verify configuration is rejected OR has no effect on SNO node
-4. Verify VMs continue to schedule with full memory allocation
-5. Verify metrics show overcommit ratio = 1.0 for SNO nodes
+**Autopilot Configuration**:
+1. Enable autopilot annotation
+2. Verify MGLRU parameters configured
+3. Verify descheduler thresholds set
+4. Verify hard limits applied
 
-**Test: Upgrade Path**
-1. Deploy cluster with overcommit disabled
-2. Create VMs without guaranteed field
-3. Enable overcommit
-4. Verify existing VMs continue running
-5. Create new VMs, verify new overcommit behavior
-
-**Test: Configuration Changes**
-1. Enable overcommit, create VMs
-2. Change overcommit ratio (e.g., 1.5 -> 1.3)
-3. Verify existing VMs not disrupted
-4. Verify new VMs use new ratio
-
-**Test: Missing Balloon Driver**
-1. Create VM without balloon driver in guest
-2. Verify VM starts successfully
-3. Verify warning logged about missing driver
-4. Verify scheduler still accounts for guaranteed memory
+**Descheduler PSI Rebalancing**:
+1. Create >80% memory saturation on node
+2. Verify descheduler switches to PSI metrics
+3. Verify VM live-migrated
+4. Verify saturated node soft-tainted
 
 ### Performance Testing
 
-- Measure balloon inflation/deflation latency
-- Measure KSM CPU overhead at various scan rates
-- Measure VM performance variance under different overcommit ratios
-- Load testing: density improvements vs. performance impact
+- Measure swap I/O impact on VM latency
+- Measure MGLRU CPU overhead
+- Measure KSM zero-page CPU overhead
+- Density improvements vs. performance degradation
+- PSI metric accuracy vs. traditional utilization
 
 ### Scalability Testing
 
-- 100 VMs on single node with 2x overcommit
-- Measure scheduler performance with overcommit calculations
-- Measure virt-handler CPU usage monitoring balloons across many VMs
-- Measure metrics system overhead with additional per-VM metrics
+- 100 VMs with 2x overcommit
+- Autopilot calculation time at scale
+- Descheduler rebalancing overhead
+- Metrics system overhead
 
 ## Graduation Criteria
 
-### Dev Preview -> Tech Preview
+### Dev Preview -> Tech Preview (OpenShift 4.17-4.18)
 
-- Feature implemented behind feature gate
-- Unit and integration tests passing
-- E2E tests for core scenarios (basic overcommit, ballooning, KSM)
-- Documentation for configuration and troubleshooting
-- Metrics and alerts available
-- Tested on SNO and standard HA clusters
-- Feedback gathered from early adopters (QE, selected partners)
+- MGLRU implementation replacing legacy LRU
+- FPR enabled by default
+- Basic memory overcommit percentage via HyperConverged CR
+- Documentation for manual configuration
 
-### Tech Preview -> GA
+### Tech Preview -> GA (OpenShift 4.22)
 
-- At least 2 releases in Tech Preview
-- No major bugs or regressions in Tech Preview
-- Full E2E test coverage including edge cases
-- Performance and scalability testing completed
-- Upgrade testing (TP -> GA upgrade path validated)
-- Documentation complete in openshift-docs
-- SLI/SLO defined for memory overcommit stability
-- Monitoring and alerting validated in production-like environments
-- Field feedback incorporated (from support, partners, customers)
-- Hypershift testing complete (if HCP supports CNV by GA)
-
-**For GA, must have:**
-- Default overcommit ratio determined (likely remains 1.0 = disabled)
-- Runbook for troubleshooting memory pressure scenarios
-- Support-approved escalation path for memory-related incidents
-
-### Removing a deprecated feature
-
-Not applicable - new feature.
+- Virtualization platform autopilot
+- KSM zero-page merging
+- Descheduler PSI integration
+- Full E2E test coverage
+- Performance and scalability validation
+- Runbooks for troubleshooting
+- Field testing with partners
 
 ## Upgrade / Downgrade Strategy
 
-### Upgrade (without overcommit -> with overcommit)
+### Upgrade (4.17 → 4.18 → 4.22)
 
-New APIs added. Existing VMs continue working. Administrator opts in by creating `MemoryOvercommitConfig`. No automatic migration.
+**4.17 → 4.18**:
+- MGLRU replaces legacy LRU automatically
+- FPR enabled by default (requires virtio driver in guest)
+- Existing VMs continue running
+- No configuration migration needed
 
-### Downgrade (with overcommit -> without overcommit)
+**4.18 → 4.22**:
+- Autopilot available as opt-in annotation
+- KSM zero-only available as annotation
+- Existing overcommit percentage settings preserved
+- No automatic changes unless autopilot enabled
 
-Remove `MemoryOvercommitConfig`. VMs with `guaranteed` must be migrated or recreated. Webhook should block downgrade if incompatible VMs exist.
+### Downgrade (4.22 → 4.18)
 
-### Mid-Upgrade Version Skew
-
-Safe: N virt-launcher + N-1 virt-controller (overcommit not enforced, but safe).
-Risky: N virt-controller + N-1 virt-launcher (overcommit without ballooning).
-Upgrade order: CRDs → virt-launcher → virt-controller → virt-api.
+- Remove autopilot annotation before downgrade
+- Autopilot-configured MGLRU parameters persist (safe)
+- Remove KSM zero-only annotation
+- Manual memoryOvercommitPercentage settings preserved
 
 ## Version Skew Strategy
 
-### Component Version Skew
-
-Guest driver version independent (feature detection at runtime). Uses standard pod memory requests (no kubelet changes). KSM always available in RHCOS.
-
-### API Version Skew
-
-New fields added to existing `v1` API (additive, backward compatible). No conversion webhook needed. Old clients ignore new fields.
+No version skew concerns. FPR requires guest driver (virtio_balloon), version-independent. MGLRU is host kernel feature, no guest dependencies. KSM zero-only is host-only.
 
 ## Operational Aspects of API Extensions
 
-### CRD: MemoryOvercommitConfig
+Uses existing HyperConverged CR. No new CRDs. Annotations are metadata changes (no webhook or admission control needed).
 
-Minimal virt-controller overhead. No impact on VM start time.
+**SLIs**:
+- Existing virt-controller and virt-handler metrics
+- New metrics for swap, KSM, PSI (see Observability section)
 
-### Webhook: VirtualMachine Memory Validation
-
-Validates `guaranteed <= guest`. Adds <10ms per VM operation. Fails if virt-api unavailable (existing behavior).
-
-### Finalizer: VirtualMachine Memory Cleanup
-
-Ensures memory bookkeeping updated on deletion. Adds <1s to deletion time.
+**Impact**: Minimal overhead. FPR asynchronous. MGLRU CPU overhead lower than legacy LRU. KSM zero-only faster than full KSM.
 
 ## Support Procedures
 
 ### Detecting Memory Overcommit Issues
 
-**Performance degradation**: Check balloon inflation metrics and node memory pressure.
+**Symptom: High swap usage**
 
-**Scheduling failures**: Check FailedScheduling events and safety thresholds.
+Check metrics:
+```bash
+oc get --raw /metrics | grep kubevirt_swap
+```
 
-**VM evictions**: Check VM events and node OOMKiller logs.
+Check node-level swap:
+```bash
+oc debug node/<node> -- chroot /host free -h
+```
+
+**Symptom: PSI metrics high**
+
+Check descheduler events:
+```bash
+oc get events -n openshift-kube-descheduler-operator | grep Migrat
+```
+
+**Symptom: VMs experiencing slow performance**
+
+Check if VM swapping:
+```bash
+oc exec -it virt-launcher-<vm> -- cat /sys/fs/cgroup/memory.swap.current
+```
 
 ### Disabling Memory Overcommit
 
-Set `overcommitRatio: 1.0` - affects new VMs only.
+Set overcommit percentage to 100 (1:1 allocation):
+```bash
+oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+  --type='merge' -p='{"spec":{"virtualization":{"memoryOvercommitPercentage":100}}}'
+```
 
-Disable ballooning per-VM - requires restart.
+Disable autopilot:
+```bash
+oc annotate hyperconverged kubevirt-hyperconverged \
+  -n openshift-cnv platform.kubevirt.io/autopilot="false"
+```
 
-Disable KSM - stops scanning, merged pages un-share gradually.
+Disable KSM zero-only:
+```bash
+oc annotate hyperconverged kubevirt-hyperconverged \
+  -n openshift-cnv platform.kubevirt.io/enable-ksm-zero-only="false"
+```
 
-### Graceful Failure Behavior
+### Observability
 
-virt-handler failure: VMs continue, no new balloon operations.
+**Metrics** (available in Prometheus):
 
-Missing balloon driver: VM starts, warning logged, no overcommit for that VM.
+```
+# Memory overcommit
+kubevirt_memory_overcommit_percentage
+kubevirt_vm_memory_guest_bytes{vm="...",namespace="..."}
+kubevirt_vm_memory_request_bytes{vm="...",namespace="..."}
 
-KSM disabled: Pages un-share gradually.
+# Swap
+kubevirt_swap_total_bytes{node="..."}
+kubevirt_swap_used_bytes{node="..."}
+kubevirt_vm_swap_used_bytes{vm="...",namespace="..."}
+
+# KSM
+kubevirt_ksm_pages_sharing{node="..."}
+kubevirt_ksm_pages_shared{node="..."}
+
+# PSI (Pressure Stall Information)
+kubevirt_psi_memory_some_seconds_total{node="..."}
+kubevirt_psi_memory_full_seconds_total{node="..."}
+
+# Descheduler
+descheduler_vm_migrations_total{reason="MemoryPressure"}
+```
+
+**Alerts**:
+
+```yaml
+- alert: MemoryOvercommitSwapHigh
+  expr: kubevirt_swap_used_bytes / kubevirt_swap_total_bytes > 0.8
+  annotations:
+    summary: "Node swap >80%, consider rebalancing or adding capacity"
+
+- alert: VMSwapThrashing
+  expr: rate(kubevirt_vm_swap_in_bytes[5m]) > 10485760  # 10MB/s
+  annotations:
+    summary: "VM swapping heavily, performance degraded"
+
+- alert: PSIMemoryPressureHigh
+  expr: rate(kubevirt_psi_memory_full_seconds_total[5m]) > 0.1
+  annotations:
+    summary: "Node experiencing memory pressure, descheduler may migrate VMs"
+```
 
 ## Infrastructure Needed [optional]
 
-### CI/Cluster Requirements
-
-**E2E test cluster**:
-- Minimum 3 worker nodes with 64 GiB RAM each (multi-node cluster required)
-- Virtualization enabled (nested virt or bare metal)
-- Existing CNV CI clusters should suffice
-- Additional SNO cluster for testing automatic exclusion behavior
-
-**Performance test cluster**:
-- 1 worker node with 128 GiB RAM (to test high VM density)
-- Bare metal preferred (more realistic results)
-- May need dedicated PSI environment allocation
-
-### New Test Images
-
-**VM images with balloon drivers**:
-- RHEL 9 with virtio-balloon module
-- Windows Server 2022 with virtio-win drivers
-- Fedora CoreOS (minimal test image)
-
-Should leverage existing [kubevirt/containerdisks](https://quay.io/organization/kubevirt) images where possible.
-
-### Metrics Infrastructure
-
-**Prometheus**:
-- Existing CNV Prometheus should suffice
-- New metrics added to existing exporters (virt-handler, virt-controller)
-- No additional Prometheus instances needed
-
-### Documentation Requirements
-
-**Admin documentation**:
-- Configuring memory overcommit (upstream + product docs)
-- Tuning KSM parameters
-- Troubleshooting memory pressure scenarios
-
-**Developer documentation**:
-- API reference for new fields
-- Example VM manifests with guaranteed memory
-- Best practices for memory sizing
-
-**Must appear in**:
-- [OpenShift Virtualization documentation](https://docs.openshift.com/container-platform/latest/virt/about_virt/about-virt.html)
-- [KubeVirt user guide](https://kubevirt.io/user-guide/) (upstream)
-- Release notes for Tech Preview and GA
+No additional infrastructure. Uses existing:
+- HyperConverged CR from openshift-cnv operator
+- Descheduler operator
+- Prometheus for metrics
