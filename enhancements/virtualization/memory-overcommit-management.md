@@ -37,7 +37,7 @@ Primary mechanisms work proactively to prevent swapping:
 - **MGLRU**: Modern swap with thrashing prevention (when swap unavoidable)
 - **KSM Zero Pages**: Deduplicates zero-filled pages across VMs
 
-The virtualization-platform-autopilot component automates configuration to minimize swap usage while maintaining the safety net for worst-case scenarios.
+The virt-platform-autopilot component automates configuration to minimize swap usage while maintaining the safety net for worst-case scenarios.
 
 ## Motivation
 
@@ -65,7 +65,7 @@ This enhancement enables statistical multiplexing - running more VMs by betting 
 - Implement Free Page Reporting (FPR) as default asynchronous memory reclamation
 - Integrate MGLRU (Multi-Generational LRU) for modern swap with per-VM tracking
 - Provide KSM zero-page merging for safe memory deduplication
-- Add virtualization-platform-autopilot for automated configuration
+- Add virt-platform-autopilot for automated configuration
 - Integrate descheduler with PSI metrics for pressure-based rebalancing
 - Deprecate WASP, legacy LRU, and traditional balloon inflation
 - Ensure safe defaults (0% overcommit unless explicitly enabled)
@@ -95,14 +95,14 @@ This enhancement implements layered defense to enable overcommit while AVOIDING 
 **Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. MGLRU ensures graceful degradation (not OOM kills) in worst-case scenarios.
 
 **Related Components**:
-- virtualization-platform-autopilot: Tunes all mechanisms to minimize swap traffic
+- virt-platform-autopilot: Tunes all mechanisms to minimize swap traffic
 - Descheduler (KubeVirtRelieveAndMigrate): Uses PSI metrics to detect pressure early and rebalance
 
 ### Workflow Description
 
 **cluster administrator** configures memory overcommit settings.
 
-**virtualization-platform-autopilot** calculates optimal parameters.
+**virt-platform-autopilot** calculates optimal parameters.
 
 **descheduler** monitors pressure and rebalances VMs.
 
@@ -207,7 +207,7 @@ spec:
 
 **Behavior**:
 
-- **autopilot annotation**: Enables virtualization-platform-autopilot to configure MGLRU, descheduler, limits
+- **autopilot annotation**: Enables virt-platform-autopilot to configure MGLRU, descheduler, limits
 - **memoryOvercommitPercentage**: Reduces pod requests; scheduler can pack more VMs per node
 - **FPR**: Enabled by default for all VMs (no configuration needed)
 - **KSM zero-only**: Merges zero-filled pages; guest-agnostic, secure
