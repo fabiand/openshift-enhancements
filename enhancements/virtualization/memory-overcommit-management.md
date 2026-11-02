@@ -27,7 +27,9 @@ superseded-by:
 
 ## Summary
 
-This enhancement proposes adding memory overcommit capabilities to OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory would traditionally allow. This includes support for memory ballooning, KSM (Kernel Samepage Merging), and configurable memory guarantees to optimize resource utilization while maintaining workload performance and stability.
+This enhancement proposes adding in-memory overcommit capabilities to OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory would traditionally allow. This includes support for memory ballooning, KSM (Kernel Samepage Merging), and configurable memory guarantees to optimize resource utilization while maintaining workload performance and stability.
+
+Note: This focuses on in-memory overcommit techniques. Swap-based overcommit is supported by OpenShift (via Kubernetes 1.35+ swap support) but requires separate configuration and is out of scope for this enhancement.
 
 ## Motivation
 
@@ -64,7 +66,7 @@ Virtual machine workloads often have significant gaps between allocated memory a
 
 ### Non-Goals
 
-- Swap-based overcommit (OpenShift nodes do not support swap)
+- Swap-based overcommit (deferred to future enhancement - requires separate swap configuration proposal)
 - Automatic live migration based on memory pressure (handled separately by descheduler)
 - Cross-node memory sharing or distributed memory management
 - Memory compression (may be addressed in future enhancement)
@@ -73,11 +75,13 @@ Virtual machine workloads often have significant gaps between allocated memory a
 
 ## Proposal
 
-This enhancement introduces three complementary mechanisms for memory overcommit:
+This enhancement introduces three complementary mechanisms for in-memory overcommit:
 
 1. **Memory Ballooning**: Guest VMs run a balloon driver that can dynamically inflate/deflate based on host memory pressure
 2. **KSM (Kernel Samepage Merging)**: Kernel-level deduplication of identical memory pages across VMs
 3. **Memory Guarantees**: API to specify minimum guaranteed physical memory per VM
+
+Note: This enhancement focuses on in-memory overcommit. Swap-based overcommit is supported by OpenShift (Kubernetes 1.35+) but requires separate configuration and is deferred to a future enhancement.
 
 ### Workflow Description
 
@@ -396,7 +400,13 @@ Increased complexity in debugging. Performance unpredictability under memory pre
 
 ### Alternative 1: Swap-based Overcommit
 
-Not chosen. OpenShift disables swap for predictability. Would require persistent storage and cause unpredictable latency.
+Deferred to separate enhancement. OpenShift supports swap for VM workloads (Kubernetes 1.35+ swap GA), but this enhancement focuses on in-memory overcommit only. Swap-based overcommit requires:
+- Swap device provisioning strategy
+- Performance tuning for VM workloads
+- Interaction design with memory ballooning
+- Per-VM swap policies
+
+Could complement this enhancement in future with dedicated design.
 
 ### Alternative 2: Memory Compression (zswap/zram)
 
