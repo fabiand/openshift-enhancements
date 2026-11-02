@@ -41,7 +41,9 @@ The virt-platform-autopilot component automates configuration to minimize swap u
 
 ## Motivation
 
-Operational data showed VMs typically utilize only ~20% of allocated RAM, leading to significant memory waste. Traditional 1:1 memory allocation prevented maximizing cluster density. 
+Operational data showed VMs typically utilize only ~20% of allocated RAM, leading to significant memory waste. Traditional 1:1 memory allocation prevented maximizing cluster density and made it impossible to meet common memory utilization target requirements of 70-80%.
+
+Without overcommit, achieving 70-80% memory utilization requires perfectly sizing VMs to match actual usage - impractical due to workload variability. With statistical multiplexing, clusters can hit these utilization targets by running more VMs than physical memory would traditionally allow.
 
 This enhancement enables statistical multiplexing - running more VMs by betting they won't all peak simultaneously. The key insight: **swap exists as a safety net, but all mechanisms work to AVOID actually swapping**. FPR proactively reclaims unused memory, descheduler rebalances before pressure builds, and MGLRU prevents thrashing if swapping becomes unavoidable. The goal is overcommit WITHOUT swap traffic under normal operation.
 
