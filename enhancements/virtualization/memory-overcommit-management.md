@@ -17,8 +17,9 @@ tracking-link: # link to the tracking ticket (for example: Jira Feature or Epic 
   - TBD
 see-also:
   - "/enhancements/scheduling/load-aware-vm-rebalancing-through-descheduler.md"
+  - "virt-platform-autopilot component (swap device automation)"
 replaces:
-  - N/A
+  - "WASP (deprecated swap mechanism)"
 superseded-by:
   - N/A
 ---
@@ -27,9 +28,9 @@ superseded-by:
 
 ## Summary
 
-This enhancement proposes adding in-memory overcommit capabilities to OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory would traditionally allow. This includes support for memory ballooning, KSM (Kernel Samepage Merging), and configurable memory guarantees to optimize resource utilization while maintaining workload performance and stability.
+This enhancement proposes adding memory overcommit capabilities to OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory would traditionally allow. The primary mechanism is **swap-based overcommit** leveraging Kubernetes 1.35+ swap support, complemented by memory ballooning, KSM (Kernel Samepage Merging), and configurable memory guarantees to optimize resource utilization while maintaining workload performance and stability.
 
-Note: This focuses on in-memory overcommit techniques. Swap-based overcommit is supported by OpenShift (via Kubernetes 1.35+ swap support) but requires separate configuration and is out of scope for this enhancement.
+This enhancement deprecates WASP (legacy swap mechanism) in favor of upstream Kubernetes swap support, with virt-platform-autopilot providing automation for swap configuration and management.
 
 ## Motivation
 
@@ -56,32 +57,36 @@ Virtual machine workloads often have significant gaps between allocated memory a
 
 ### Goals
 
-- Enable configurable memory overcommit ratios at the cluster and namespace level
+- Enable swap-based memory overcommit using Kubernetes 1.35+ swap support
+- Configure swap devices and policies for VM workloads
 - Implement memory ballooning support for guest VMs with balloon driver
 - Integrate KSM (Kernel Samepage Merging) for transparent memory deduplication
 - Provide memory guarantee mechanisms for critical workloads
-- Add observability metrics for memory overcommit and utilization
+- Add observability metrics for memory overcommit, swap usage, and utilization
 - Ensure safe defaults that prevent node memory pressure
 - Support smooth migration between overcommit configurations
+- Deprecate WASP in favor of Kubernetes swap
+- Integration with virt-platform-autopilot for automated swap provisioning
 
 ### Non-Goals
 
-- Swap-based overcommit (deferred to future enhancement - requires separate swap configuration proposal)
 - Automatic live migration based on memory pressure (handled separately by descheduler)
 - Cross-node memory sharing or distributed memory management
 - Memory compression (may be addressed in future enhancement)
 - Modifying Kubernetes pod memory management (focuses on VMs only)
 - Single-Node OpenShift (SNO) support - deferred to future enhancement due to unique stability requirements
+- WASP (legacy swap mechanism) - deprecated in favor of Kubernetes swap support
 
 ## Proposal
 
-This enhancement introduces three complementary mechanisms for in-memory overcommit:
+This enhancement introduces four complementary mechanisms for memory overcommit:
 
-1. **Memory Ballooning**: Guest VMs run a balloon driver that can dynamically inflate/deflate based on host memory pressure
-2. **KSM (Kernel Samepage Merging)**: Kernel-level deduplication of identical memory pages across VMs
-3. **Memory Guarantees**: API to specify minimum guaranteed physical memory per VM
+1. **Swap-based Overcommit**: Leverage Kubernetes 1.35+ swap support to allow memory pages to be swapped to disk (primary mechanism)
+2. **Memory Ballooning**: Guest VMs run a balloon driver that can dynamically inflate/deflate based on host memory pressure
+3. **KSM (Kernel Samepage Merging)**: Kernel-level deduplication of identical memory pages across VMs
+4. **Memory Guarantees**: API to specify minimum guaranteed physical memory per VM
 
-Note: This enhancement focuses on in-memory overcommit. Swap-based overcommit is supported by OpenShift (Kubernetes 1.35+) but requires separate configuration and is deferred to a future enhancement.
+**Related Component**: virt-platform-autopilot automates swap device provisioning and configuration.
 
 ### Workflow Description
 
@@ -177,6 +182,10 @@ type MemoryOvercommitConfigSpec struct {
     // +kubebuilder:validation:Maximum=4.0
     OvercommitRatio *float64 `json:"overcommitRatio,omitempty"`
     
+    // Swap configures swap-based memory overcommit
+    // +optional
+    Swap *SwapConfig `json:"swap,omitempty"`
+    
     // KSM configures Kernel Samepage Merging for memory deduplication
     // +optional
     KSM *KSMConfig `json:"ksm,omitempty"`
@@ -190,6 +199,30 @@ type MemoryOvercommitConfigSpec struct {
     // SafetyThresholds defines when to stop accepting new VMs
     // +optional
     SafetyThresholds *SafetyThresholds `json:"safetyThresholds,omitempty"`
+}
+
+type SwapConfig struct {
+    // Enabled controls whether swap is configured on matching nodes
+    // Requires virt-platform-autopilot for automated provisioning
+    // +optional
+    Enabled bool `json:"enabled"`
+    
+    // SwapSizeMultiplier determines swap device size as multiple of node RAM
+    // For example, 2.0 means swap size = 2x node physical memory
+    // Default: 2.0
+    // +optional
+    // +kubebuilder:validation:Minimum=0.5
+    // +kubebuilder:validation:Maximum=4.0
+    SwapSizeMultiplier *float64 `json:"swapSizeMultiplier,omitempty"`
+    
+    // DefaultSwapBehavior for VMs without explicit swapBehavior setting
+    // UnlimitedSwap: VM can use all available swap
+    // LimitedSwap: VM swap limited to memorySwap.swapLimitBytes
+    // NoSwap: VM cannot use swap
+    // Default: UnlimitedSwap
+    // +optional
+    // +kubebuilder:validation:Enum=UnlimitedSwap;LimitedSwap;NoSwap
+    DefaultSwapBehavior *string `json:"defaultSwapBehavior,omitempty"`
 }
 
 type KSMConfig struct {
@@ -256,6 +289,10 @@ type Memory struct {
     // Ballooning configures the memory balloon device
     // +optional
     Ballooning *BallooningConfig `json:"ballooning,omitempty"`
+    
+    // MemorySwap configures swap behavior for this VM
+    // +optional
+    MemorySwap *MemorySwap `json:"memorySwap,omitempty"`
 }
 
 type BallooningConfig struct {
@@ -269,6 +306,20 @@ type BallooningConfig struct {
     // Default: 10
     // +optional
     StatsInterval *int32 `json:"statsInterval,omitempty"`
+}
+
+// MemorySwap configures swap behavior for a VM
+type MemorySwap struct {
+    // SwapBehavior controls how swap is used for this VM
+    // Inherits from MemoryOvercommitConfig.defaultSwapBehavior if not set
+    // +optional
+    // +kubebuilder:validation:Enum=UnlimitedSwap;LimitedSwap;NoSwap
+    SwapBehavior *string `json:"swapBehavior,omitempty"`
+    
+    // SwapLimitBytes limits swap usage for this VM
+    // Only applies when swapBehavior=LimitedSwap
+    // +optional
+    SwapLimitBytes *resource.Quantity `json:"swapLimitBytes,omitempty"`
 }
 ```
 
@@ -329,6 +380,34 @@ Not applicable. OKE does not include OpenShift Virtualization.
 
 ### Implementation Details/Notes/Constraints
 
+#### Swap-based Overcommit Implementation
+
+**Swap Device Provisioning**:
+- virt-platform-autopilot manages LVM-based swap volumes
+- Default swap size: 2x node RAM (configurable via MemoryOvercommitConfig)
+- Swap devices provisioned per node, shared by all VMs on that node
+
+**Kubernetes Swap Integration**:
+- Leverages Kubernetes 1.35+ swap support
+- kubelet configured with `failSwapOn: false` and `memorySwap.swapBehavior`
+- Node capacity extended by swap size for scheduling calculations
+
+**VM Swap Policies**:
+- Per-VM swap limits configurable via `spec.memorySwap.swapLimitBytes`
+- Swap behavior: UnlimitedSwap (default), LimitedSwap, or NoSwap
+- virt-launcher pod inherits swap configuration from kubelet
+
+**Interaction with Ballooning**:
+1. Memory pressure detected
+2. Balloon inflates first (fast, in-memory reclamation)
+3. If pressure continues, kernel swaps pages to disk
+4. Both mechanisms work together: balloon for transient, swap for sustained pressure
+
+**Performance**:
+- SSD/NVMe recommended for swap devices (virt-platform-autopilot validates)
+- Swap I/O slower than RAM but prevents OOM kills
+- Metrics track swap usage to detect over-subscription
+
 #### Memory Ballooning Implementation
 
 virt-launcher pod requests `guaranteed` memory; VM sees `guest` memory. virtio-balloon device attached. virt-handler inflates balloon when memory pressure detected via cgroup stats. Requires guest driver (virtio_balloon for Linux, virtio-win for Windows). Balloon never deflates below `guaranteed` level.
@@ -339,7 +418,7 @@ MachineConfig enables KSM via `/sys/kernel/mm/ksm/run = 1`. Scanning parameters 
 
 #### Scheduler Changes
 
-Multiplies node allocatable by overcommit ratio. Filters on `guaranteed` memory. Excludes SNO nodes via label. Respects safety thresholds.
+Multiplies node allocatable by overcommit ratio (includes swap capacity). Filters on `guaranteed` memory. Excludes SNO nodes via label. Respects safety thresholds.
 
 #### Observability
 
@@ -350,11 +429,14 @@ New Prometheus metrics:
 kubevirt_memory_overcommit_ratio{node="worker-1"} 1.5
 kubevirt_memory_physical_bytes{node="worker-1"} 68719476736
 kubevirt_memory_allocatable_bytes{node="worker-1"} 103079215104
+kubevirt_swap_total_bytes{node="worker-1"} 137438953472
+kubevirt_swap_used_bytes{node="worker-1"} 34359738368
 
 # Per-VM
 kubevirt_vm_memory_guest_bytes{vm="web-server",namespace="prod"} 8589934592
 kubevirt_vm_memory_guaranteed_bytes{vm="web-server",namespace="prod"} 4294967296
 kubevirt_vm_memory_balloon_actual_bytes{vm="web-server",namespace="prod"} 6442450944
+kubevirt_vm_swap_used_bytes{vm="web-server",namespace="prod"} 2147483648
 
 # KSM
 kubevirt_ksm_pages_sharing{node="worker-1"} 524288
@@ -373,6 +455,16 @@ New alerts:
   expr: (kubevirt_vm_memory_balloon_actual_bytes / kubevirt_vm_memory_guest_bytes) < 0.5
   annotations:
     summary: "VM {{ $labels.vm }} balloon inflated >50%, possible memory pressure"
+
+- alert: SwapUsageHigh
+  expr: kubevirt_swap_used_bytes / kubevirt_swap_total_bytes > 0.8
+  annotations:
+    summary: "Node {{ $labels.node }} swap usage >80%, consider adding capacity"
+
+- alert: VMSwapThrashing
+  expr: rate(kubevirt_vm_swap_in_bytes[5m]) > 10485760  # 10MB/s
+  annotations:
+    summary: "VM {{ $labels.vm }} swapping heavily, performance degraded"
 ```
 
 ### Risks and Mitigations
@@ -398,25 +490,29 @@ Increased complexity in debugging. Performance unpredictability under memory pre
 
 ## Alternatives (Not Implemented)
 
-### Alternative 1: Swap-based Overcommit
+### Alternative 1: WASP (Legacy Swap Mechanism)
 
-Deferred to separate enhancement. OpenShift supports swap for VM workloads (Kubernetes 1.35+ swap GA), but this enhancement focuses on in-memory overcommit only. Swap-based overcommit requires:
-- Swap device provisioning strategy
-- Performance tuning for VM workloads
-- Interaction design with memory ballooning
-- Per-VM swap policies
+Not chosen. WASP is deprecated in favor of upstream Kubernetes swap support (GA in 1.35+). Kubernetes swap provides:
+- Standardized swap configuration via kubelet
+- QoS-aware swap policies
+- Better upstream integration and support
+- Per-pod swap limits
 
-Could complement this enhancement in future with dedicated design.
+This enhancement uses Kubernetes swap instead of WASP.
 
-### Alternative 2: Memory Compression (zswap/zram)
+### Alternative 2: In-memory Only (No Swap)
 
-Not chosen. CPU overhead for compression/decompression. Unpredictable compression ratios. Could be future enhancement.
+Not chosen. While ballooning and KSM provide some overcommit, swap provides the largest capacity gains and is more predictable than aggressive in-memory reclamation. Swap allows graceful degradation under memory pressure instead of OOM kills.
 
-### Alternative 3: Automatic Memory Right-sizing
+### Alternative 3: Memory Compression (zswap/zram)
+
+Not chosen. CPU overhead for compression/decompression. Unpredictable compression ratios. Swap to disk is more predictable. Could complement swap in future.
+
+### Alternative 4: Automatic Memory Right-sizing
 
 Not chosen. Requires VM restart. Should be separate day-2 operations enhancement.
 
-### Alternative 4: Per-Namespace Overcommit Policies
+### Alternative 5: Per-Namespace Overcommit Policies
 
 Not chosen. Scheduler complexity. ResourceQuotas already provide namespace limits. Partially achievable via nodeSelector.
 
