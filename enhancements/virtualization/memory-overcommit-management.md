@@ -639,48 +639,108 @@ oc annotate hyperconverged kubevirt-hyperconverged \
 
 ### Observability
 
-**Metrics** (available in Prometheus):
+**Recording Rules** (see [memory monitoring rules][memory-rules]):
 
+```promql
+# Node Memory Metrics
+openshift:node:memory:bytes{scope, tier, utilized, temperature, usage}
+openshift:node:memory:utilization:ratio
+openshift:node:memory:pressure:ratio
+openshift:node:memory:overcommit:ratio
+openshift:node:memory:requests:bytes
+
+# VM Memory Metrics  
+openshift:vm:memory:bytes{tier, temperature}
+openshift:vm:memory:utilization:ratio
+openshift:vm:memory:overcommit:ratio
+openshift:vm:virtual:memory:bytes
+openshift:vm:memory:requests:bytes
+
+# Cluster-wide Metrics
+openshift:cluster:memory:utilization:ratio
+openshift:cluster:memory:overcommit:ratio
+openshift:cluster:memory:imbalance:distance{quantile="0.80"}
+openshift:cluster:memory:requests:bytes
+
+# Memory Tier Information
+openshift:node:memory:tier:info{tier, technology, latency, addressable}
 ```
-# Memory overcommit
-kubevirt_memory_overcommit_percentage
-kubevirt_vm_memory_guest_bytes{vm="...",namespace="..."}
-kubevirt_vm_memory_request_bytes{vm="...",namespace="..."}
 
-# Swap
-kubevirt_swap_total_bytes{node="..."}
-kubevirt_swap_used_bytes{node="..."}
-kubevirt_vm_swap_used_bytes{vm="...",namespace="..."}
+**Key Metrics by Tier** (see [memory monitoring reference][memory-rules-md]):
 
-# KSM
-kubevirt_ksm_pages_sharing{node="..."}
-kubevirt_ksm_pages_shared{node="..."}
+- **Tier 0 (DRAM)**: ~100ns latency, primary memory
+- **Tier 1 (CXL)**: ~200ns latency, byte-addressable expansion (future)
+- **Tier 2 (Swap)**: ~ms latency, disk-backed safety net
 
-# PSI (Pressure Stall Information)
-kubevirt_psi_memory_some_seconds_total{node="..."}
-kubevirt_psi_memory_full_seconds_total{node="..."}
+**Temperature Classification**:
 
-# Descheduler
-descheduler_vm_migrations_total{reason="MemoryPressure"}
-```
+- `hot`: Working set, recently accessed (high OOM risk if unavailable)
+- `warm`: Inactive file cache (can be freed without OOM, but disk I/O impact)
 
-**Alerts**:
+**Utilization Targets** (see [memory monitoring reference][memory-rules-md]):
+
+| Metric | Target Range | Interpretation |
+|--------|--------------|----------------|
+| `utilization` | 0.7 - 0.8 | Approaching 1.0 signals need for more capacity |
+| `pressure` | < 0.1 | Detects contention before OOM |
+| `overcommit` | < 1.5 | >1.0 is normal, high values increase OOM risk |
+
+**Imbalance Severity** (cluster-wide):
+
+| Distance (p80) | Status |
+|----------------|--------|
+| < 0.11 | Healthy balanced |
+| 0.11-0.22 | Unhealthy balance |
+| 0.22-0.33 | Severely unbalanced |
+| > 0.33 | Critically unbalanced |
+
+**Alert Conditions** (examples based on recording rules):
 
 ```yaml
-- alert: MemoryOvercommitSwapHigh
-  expr: kubevirt_swap_used_bytes / kubevirt_swap_total_bytes > 0.8
+# High VM Utilization
+- alert: VMMemoryUtilizationHigh
+  expr: openshift:vm:memory:utilization:ratio > 0.8
+  for: 5m
   annotations:
-    summary: "Node swap >80%, consider rebalancing or adding capacity"
+    summary: "VM {{ $labels.name }} memory utilization >80%"
 
-- alert: VMSwapThrashing
-  expr: rate(kubevirt_vm_swap_in_bytes[5m]) > 10485760  # 10MB/s
+# High VM Overcommit
+- alert: VMMemoryOvercommitHigh
+  expr: openshift:vm:memory:overcommit:ratio > 1.5
+  for: 10m
   annotations:
-    summary: "VM swapping heavily, performance degraded"
+    summary: "VM {{ $labels.name }} overcommit >1.5x, elevated OOM risk"
 
-- alert: PSIMemoryPressureHigh
-  expr: rate(kubevirt_psi_memory_full_seconds_total[5m]) > 0.1
+# Node Pressure
+- alert: NodeMemoryPressureHigh
+  expr: openshift:node:memory:pressure:ratio > 0.1
+  for: 5m
   annotations:
-    summary: "Node experiencing memory pressure, descheduler may migrate VMs"
+    summary: "Node {{ $labels.node }} memory pressure >10%, descheduler may rebalance"
+
+# System Memory Overflow
+- alert: SystemMemoryExceedsReservation
+  expr: openshift:node:memory:bytes{scope="workloads", utilized="true", usage="system-overflow"} > 0
+  for: 5m
+  annotations:
+    summary: "Node {{ $labels.node }} system memory borrowing from workloads"
+
+# Cluster Imbalance
+- alert: ClusterMemoryImbalanceSevere
+  expr: openshift:cluster:memory:imbalance:distance{quantile="0.80"} > 0.22
+  for: 15m
+  annotations:
+    summary: "Cluster memory severely unbalanced, descheduler should rebalance"
+
+# Swap Usage (Tier 2)
+- alert: NodeSwapUtilizationHigh
+  expr: |
+    openshift:node:memory:bytes{tier="2", utilized="true"} 
+    / (openshift:node:memory:bytes{tier="2", utilized="true"} 
+       + openshift:node:memory:bytes{tier="2", utilized="false"}) > 0.5
+  for: 10m
+  annotations:
+    summary: "Node {{ $labels.node }} swap usage >50%, memory pressure safety net active"
 ```
 
 ## Infrastructure Needed [optional]
@@ -688,4 +748,25 @@ descheduler_vm_migrations_total{reason="MemoryPressure"}
 No additional infrastructure. Uses existing:
 - HyperConverged CR from openshift-cnv operator
 - Descheduler operator
-- Prometheus for metrics
+- Prometheus for metrics and recording rules
+
+## References
+
+### Implementation Documentation
+
+- [Memory Management in OpenShift Virtualization][rh-blog-2025] - Overview of FPR, MGLRU, and memory management mechanisms (Red Hat Developer Blog, January 2025)
+- [Red Hat OpenShift Virtualization Memory Management Overview][rh-article-2026] - Detailed guide on memory overcommit, MGLRU, autopilot, and PSI metrics (Red Hat Developer Articles, October 2026)
+
+### Monitoring and Observability
+
+- [Memory Monitoring Rules Reference][memory-rules-md] - Detailed explanation of memory metrics, thresholds, and monitoring strategies
+- [Memory Monitoring Rules (YAML)][memory-rules] - Prometheus recording rules for memory tier tracking, VM metrics, and cluster-wide monitoring
+
+### Related Enhancements
+
+- [Load-aware VM Rebalancing through Descheduler](/enhancements/scheduling/load-aware-vm-rebalancing-through-descheduler.md) - Descheduler integration with PSI metrics
+
+[rh-blog-2025]: https://developers.redhat.com/blog/2025/01/31/memory-management-openshift-virtualization
+[rh-article-2026]: https://developers.redhat.com/articles/2026/10/15/red-hat-openshift-virtualization-memory-management-overview
+[memory-rules-md]: https://github.com/fabiand/perses-dashboards/blob/main/rules/memory.md
+[memory-rules]: https://github.com/fabiand/perses-dashboards/blob/main/rules/memory.yaml
