@@ -86,9 +86,9 @@ This enhancement enables statistical multiplexing - running more VMs by betting 
 This enhancement implements layered defense to enable overcommit while AVOIDING swap traffic:
 
 **Proactive Mechanisms** (prevent swapping):
-1. **Free Page Reporting (FPR)**: Asynchronous reporting of unused pages from guest to hypervisor (primary reclamation, enabled by default)
+1. **Free Page Reporting (FPR)**: Guest-cooperative asynchronous reporting of unused pages to hypervisor (requires virtio driver in guest, primary reclamation, enabled by default)
 2. **Descheduler with PSI**: Live-migrates VMs when pressure detected, BEFORE swapping starts
-3. **KSM Zero Pages**: Deduplicates zero-filled pages across VMs, reducing total memory footprint
+3. **KSM Zero Pages**: Guest-agnostic deduplication of zero-filled pages across VMs (no guest driver required, reduces total memory footprint)
 4. **Memory Overcommit Percentage**: Reduces pod memory requests to enable statistical multiplexing
 
 **Targeted Eviction and Thrashing Prevention** (graceful degradation when unavoidable):
@@ -249,11 +249,13 @@ Not applicable. OKE does not include OpenShift Virtualization.
 
 #### Free Page Reporting (FPR) Implementation
 
-**Mechanism**:
+**Guest-Cooperative Mechanism** - requires guest driver cooperation.
+
+**How it Works**:
 - Enabled by default (no configuration needed)
-- Guest virtio driver scans free memory lists
-- Reports free pages to hypervisor via QMP channel
-- Hypervisor returns pages to host allocation pool
+- **Guest** virtio driver scans free memory lists
+- **Guest** reports free pages to hypervisor via QMP channel
+- **Hypervisor** returns pages to host allocation pool
 - **Asynchronous**: No forced allocation (unlike traditional ballooning)
 
 **Advantages over Traditional Ballooning**:
@@ -262,12 +264,16 @@ Not applicable. OKE does not include OpenShift Virtualization.
 - Conflicts with guest-level memory compression
 - FPR observes already-freed pages without forcing allocation
 
-**Guest Driver Requirements**:
-- Linux: virtio_balloon module (included in most distros)
-- Windows: virtio-win guest tools
+**Guest Driver Requirements** (cooperative mechanism):
+- **Linux**: virtio_balloon module (included in most modern distributions)
+- **Windows**: virtio-win guest tools (must be installed)
+- **Without driver**: VM runs but FPR unavailable (no automatic reclamation)
 
 **Disabled When**:
 - VM uses hugepages (memory pre-allocated and pinned)
+- Guest does not have virtio driver installed
+
+**Implication**: FPR effectiveness depends on guest cooperation. VMs without drivers get no automatic memory reclamation.
 
 #### Targeted Eviction and Thrashing Prevention (MGLRU)
 
@@ -327,24 +333,38 @@ MGLRU orchestrates tiering to high-performance devices:
 
 #### KSM Zero Pages Implementation
 
+**Guest-Agnostic Mechanism** - no guest driver or cooperation required.
+
 **Since OpenShift 4.22**. Replaces full KSM.
 
-**Mechanism**:
-- Host kernel scans for zero-filled pages only
-- Merges identical zero pages across VMs
-- Guest-agnostic (no guest driver required)
+**How it Works**:
+- **Host** kernel scans memory pages from hypervisor perspective
+- Identifies zero-filled pages (all zeros) across all VMs
+- Merges identical zero pages, reducing total memory footprint
+- **Guest-agnostic**: Works regardless of guest OS, no driver needed
 
-**Why Zero-Only**:
+**Why Zero-Only** (not full KSM):
 - Full KSM security concerns: arbitrary page content exposure risk
 - Full KSM performance concerns: slows memory operations
-- Zero pages common in Windows workloads
-- Faster and less CPU-intensive than full KSM
+- Zero pages are:
+  - Common in Windows workloads (uninitialized memory)
+  - Safe to merge (no information disclosure)
+  - Fast to scan (simple comparison)
+- Lower CPU overhead than full KSM
+
+**Advantages of Guest-Agnostic Approach**:
+- Works on any guest OS (Linux, Windows, others)
+- No guest driver installation required
+- No guest configuration needed
+- No compatibility concerns with guest kernel versions
 
 **Configuration**:
 ```bash
 oc annotate hyperconverged kubevirt-hyperconverged \
   -n openshift-cnv platform.kubevirt.io/enable-ksm-zero-only="true"
 ```
+
+**Implication**: Unlike FPR (guest-cooperative), KSM zero pages work universally across all VMs without guest involvement.
 
 #### Virtualization Platform Autopilot
 
