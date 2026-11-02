@@ -93,10 +93,16 @@ This enhancement implements layered defense to enable overcommit while AVOIDING 
 3. **KSM Zero Pages**: Guest-agnostic deduplication of zero-filled pages across VMs (no guest driver required, reduces total memory footprint)
 4. **Memory Overcommit Percentage**: Reduces pod memory requests to enable statistical multiplexing
 
-**Swap as Safety Net** (graceful degradation when unavoidable):
-5. **MGLRU-based Swap**: Modern multi-generational LRU provides intelligent swap when proactive mechanisms cannot prevent memory pressure. Targets cold pages for eviction while protecting hot pages, with Bloom filter thrashing prevention and per-VM tracking.
+**Safety Net** (graceful degradation when unavoidable):
 
-**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. When memory pressure cannot be avoided, MGLRU-based swap ensures graceful degradation (not OOM kills) through targeted eviction of truly cold pages.
+5. **Swap (Secondary Memory Tier)**: Extends physical RAM with secondary storage (SSD/NVMe recommended). When physical memory exhausted, kernel moves pages to swap device. Swap is Tier 2 memory (~ms latency vs ~100ns for DRAM Tier 0).
+
+6. **MGLRU (Eviction Heuristic)**: Multi-Generational LRU algorithm intelligently selects WHICH pages to evict to swap. Targets cold pages (rarely accessed) for eviction while protecting hot pages (working set). Uses generational tracking and Bloom filters to prevent thrashing.
+
+**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. When memory pressure cannot be avoided:
+- **Swap** provides the storage tier for evicted pages (extends physical memory)
+- **MGLRU** provides the intelligence for selecting which pages to evict (targets cold pages)
+- Together: Graceful degradation (not OOM kills) through targeted eviction to secondary storage
 
 **Critical Dependency** - Load-Aware Rebalancing (see [descheduler enhancement][descheduler-enhancement]):
 
@@ -290,9 +296,38 @@ Not applicable. OKE does not include OpenShift Virtualization.
 
 **Implication**: FPR effectiveness depends on guest cooperation. VMs without drivers get no automatic memory reclamation.
 
-#### Targeted Eviction and Thrashing Prevention (MGLRU)
+#### Swap - Secondary Memory Tier
 
-**Default since OpenShift 4.18**. Multi-Generational LRU (MGLRU) replaces legacy active/inactive LRU and WASP, providing intelligent page replacement that minimizes swap traffic through targeted eviction.
+**Basic Mechanism**: Extends physical RAM with secondary storage.
+
+**How Swap Works**:
+- Kernel moves pages from DRAM (Tier 0) to disk/SSD (Tier 2)
+- Frees physical RAM for other uses
+- Pages can be swapped back in when accessed (swap-in)
+
+**Storage Tier Classification**:
+- **Tier 0 (DRAM)**: ~100ns latency, primary memory
+- **Tier 1 (CXL)**: ~200ns latency, byte-addressable expansion (future)
+- **Tier 2 (Swap)**: ~ms latency, disk-backed secondary storage
+
+**Swap Device Recommendations**:
+- SSD/NVMe strongly recommended (not spinning disks)
+- Lower latency = less performance impact when swapping occurs
+- Future: CXL-attached memory may become Tier 1 alternative
+
+**Configuration**:
+- Swap devices provisioned per node (not per VM)
+- Shared across all VMs on that node
+- Size typically 1-2x node physical RAM
+
+#### MGLRU - Intelligent Eviction Heuristic
+
+**Default since OpenShift 4.18**. Multi-Generational LRU (MGLRU) replaces legacy active/inactive LRU, providing intelligent selection of WHICH pages to evict to swap.
+
+**MGLRU vs Swap - Distinct Roles**:
+- **Swap** = WHERE evicted pages go (secondary storage tier)
+- **MGLRU** = WHICH pages to evict (selection heuristic)
+- Together: Intelligent swap that minimizes performance impact
 
 **Why MGLRU is Better**:
 
