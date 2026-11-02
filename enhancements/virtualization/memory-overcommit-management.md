@@ -74,12 +74,14 @@ This enhancement enables statistical multiplexing - running more VMs by betting 
 
 ### Non-Goals
 
-- Automatic live migration based on memory pressure (handled by descheduler, not this enhancement)
+- **Load-aware VM rebalancing and live migration**: Critical for safe overcommit but covered by separate [descheduler enhancement][descheduler-enhancement]. The descheduler with KubeVirtRelieveAndMigrate strategy is REQUIRED for production memory overcommit - it monitors PSI (Pressure Stall Information) metrics and live-migrates VMs from overloaded nodes BEFORE swapping occurs. This enhancement provides the mechanisms (FPR, MGLRU, KSM); descheduler provides the intelligence to prevent overcommit from causing memory pressure.
 - Cross-node memory sharing or distributed memory management
 - Memory compression (zswap/zram)
 - Modifying Kubernetes pod memory management for non-VM workloads
 - Single-Node OpenShift (SNO) support - deferred due to control plane stability requirements
 - Full KSM (arbitrary page merging) - security and performance concerns
+
+[descheduler-enhancement]: /enhancements/scheduling/load-aware-vm-rebalancing-through-descheduler.md
 
 ## Proposal
 
@@ -96,9 +98,22 @@ This enhancement implements layered defense to enable overcommit while AVOIDING 
 
 **Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. When memory pressure cannot be avoided, MGLRU-based swap ensures graceful degradation (not OOM kills) through targeted eviction of truly cold pages.
 
+**Critical Dependency** - Load-Aware Rebalancing (see [descheduler enhancement][descheduler-enhancement]):
+
+The descheduler with KubeVirtRelieveAndMigrate strategy is REQUIRED for safe production memory overcommit. While this enhancement provides the mechanisms (FPR, MGLRU, KSM, autopilot), the descheduler provides the intelligence:
+
+- Monitors PSI (Pressure Stall Information) metrics at >80% utilization
+- Live-migrates VMs from saturated nodes BEFORE swapping starts
+- Soft-taints overloaded nodes (PreferNoSchedule)
+- Enables proactive rebalancing instead of reactive swapping
+
+**Without descheduler**: Memory overcommit works but relies on MGLRU swap as primary defense (slower, performance impact).
+
+**With descheduler**: Memory overcommit avoids swapping through proactive live migration (swap becomes true safety net).
+
 **Related Components**:
 - virt-platform-autopilot: Tunes all mechanisms to minimize swap traffic
-- Descheduler (KubeVirtRelieveAndMigrate): Uses PSI metrics to detect pressure early and rebalance
+- Descheduler (KubeVirtRelieveAndMigrate): Provides load-aware rebalancing intelligence (separate enhancement)
 
 ### Workflow Description
 
