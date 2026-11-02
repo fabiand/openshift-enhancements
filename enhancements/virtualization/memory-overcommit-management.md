@@ -89,12 +89,12 @@ This enhancement implements layered defense to enable overcommit while AVOIDING 
 1. **Free Page Reporting (FPR)**: Asynchronous reporting of unused pages from guest to hypervisor (primary reclamation, enabled by default)
 2. **Descheduler with PSI**: Live-migrates VMs when pressure detected, BEFORE swapping starts
 3. **KSM Zero Pages**: Deduplicates zero-filled pages across VMs, reducing total memory footprint
+4. **Memory Overcommit Percentage**: Reduces pod memory requests to enable statistical multiplexing
 
-**Safety Net** (when swap unavoidable):
-4. **MGLRU (Multi-Generational LRU)**: Modern swap with Bloom filter thrashing prevention and per-VM tracking
-5. **Memory Overcommit Percentage**: Reduces pod memory requests to enable statistical multiplexing
+**Targeted Eviction and Thrashing Prevention** (graceful degradation when unavoidable):
+5. **MGLRU (Multi-Generational LRU)**: Intelligent page replacement that targets cold pages for eviction while protecting hot pages, with Bloom filter-based thrashing prevention and per-VM tracking
 
-**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. MGLRU ensures graceful degradation (not OOM kills) in worst-case scenarios.
+**Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. MGLRU ensures graceful degradation (not OOM kills) in worst-case scenarios through targeted eviction of truly cold pages.
 
 **Related Components**:
 - virt-platform-autopilot: Tunes all mechanisms to minimize swap traffic
@@ -269,30 +269,61 @@ Not applicable. OKE does not include OpenShift Virtualization.
 **Disabled When**:
 - VM uses hugepages (memory pre-allocated and pinned)
 
-#### MGLRU (Multi-Generational LRU) Implementation
+#### Targeted Eviction and Thrashing Prevention (MGLRU)
 
-**Default since OpenShift 4.18**. Replaces legacy active/inactive LRU and WASP.
+**Default since OpenShift 4.18**. Multi-Generational LRU (MGLRU) replaces legacy active/inactive LRU and WASP, providing intelligent page replacement that minimizes swap traffic through targeted eviction.
+
+**Why MGLRU is Better**:
+
+Legacy LRU used simple active/inactive lists, leading to:
+- Poor targeting: Hot pages could be evicted if they aged out
+- Thrashing: Evicted pages re-swapped in immediately
+- High CPU overhead: Constant rescanning
+
+MGLRU solves these through generational tracking and Bloom filters.
 
 **Generational Page Tracking**:
-- Generation 0: Hot pages (protected with Bloom filters)
-- Generation 1: Aging pages
-- Generation 2/3: Cold pages (eviction targets)
 
-**Per-VM Tracking**:
-- Linux cgroups track memory per virt-launcher pod
+Pages grouped by access recency into generations:
+- **Generation 0**: Hot pages (frequently accessed, protected from eviction)
+- **Generation 1**: Aging pages (transitioning)
+- **Generation 2/3**: Cold pages (rarely accessed, eviction candidates)
+
+Eviction targets Gen 2/3 pages first, protecting actually-used memory.
+
+**Thrashing Prevention with Bloom Filters**:
+
+Bloom filters track recently evicted page addresses:
+- When evicting page: Add to Bloom filter
+- When accessing page: Check Bloom filter
+- If in filter: Page was recently evicted, protect from re-eviction
+- Result: Prevents re-swapping same pages repeatedly
+
+Lower CPU overhead than legacy LRU's constant rescanning.
+
+**Per-VM Memory Tracking**:
+
+Linux cgroups track memory per virt-launcher pod:
 - Accurate per-VM swap attribution
-
-**Thrashing Prevention**:
-- Bloom filters track recently evicted pages
-- Prevents re-swapping same pages (lower CPU overhead)
+- Metrics show which VM is swapping
+- Enables targeted troubleshooting
 
 **Configuration**:
-- Autopilot calculates optimal parameters based on node memory, workload
-- Manual configuration not recommended (complex parameter interactions)
+
+virt-platform-autopilot calculates optimal MGLRU parameters:
+- Generation advancement thresholds
+- Bloom filter sizes
+- Eviction scan rates
+- Based on: node memory, number of VMs, workload patterns
+
+Manual configuration not recommended due to complex parameter interactions.
 
 **Secondary Memory Tiers**:
-- High-performance NVMe/SSD for swap devices
-- Future: CXL (Compute Express Link) byte-addressable expansion
+
+MGLRU orchestrates tiering to high-performance devices:
+- Recommend NVMe/SSD for swap devices (not spinning disks)
+- Future: CXL (Compute Express Link) byte-addressable memory expansion
+- Hardware-accelerated tiering for sub-millisecond latency
 
 #### KSM Zero Pages Implementation
 
