@@ -29,7 +29,9 @@ superseded-by:
 
 ## Summary
 
-This enhancement implemented memory overcommit capabilities for OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory through statistical multiplexing. The implementation uses defense-in-depth mechanisms to AVOID swap traffic while keeping swap available as a safety net.
+This enhancement implemented memory overcommit capabilities for OpenShift Virtualization, enabling clusters to run more virtual machines than available physical memory through statistical multiplexing. It extends OpenShift Virtualization's memory architecture from native DRAM (Tier 0) to include swap-backed secondary storage (Tier 2), part of a broader three-tier memory model vision that will eventually include CXL memory expansion (Tier 1).
+
+The implementation uses defense-in-depth mechanisms to AVOID swap traffic while keeping swap available as a safety net.
 
 Primary mechanisms work proactively to prevent swapping:
 - **Free Page Reporting (FPR)**: Asynchronous reclamation of unused pages
@@ -40,6 +42,23 @@ Primary mechanisms work proactively to prevent swapping:
 The virt-platform-autopilot component automates configuration to minimize swap usage while maintaining the safety net for worst-case scenarios.
 
 ## Motivation
+
+### Three-Tier Memory Architecture Vision
+
+OpenShift Virtualization is architecting toward a three-tier memory model to provide flexible memory hierarchy options:
+
+- **Tier 0 (DRAM)**: Traditional memory, natively supported in OpenShift Virtualization (~100ns latency, baseline performance)
+- **Tier 1 (CXL)**: Byte-addressable memory expansion via Compute Express Link, work in progress (~200ns latency, capacity expansion with near-DRAM performance)
+- **Tier 2 (Swap)**: Disk-backed secondary storage, **this proposal** (~ms latency, safety net for overcommit)
+
+Each tier addresses different use cases with distinct constraints, requirements, and implications:
+- **DRAM (Tier 0)**: Performance-critical workloads, no configuration needed, limited by physical capacity
+- **CXL (Tier 1)**: Memory capacity expansion, requires CXL-capable hardware, transparent to workloads
+- **Swap (Tier 2)**: Overcommit safety net, works with existing hardware, performance impact if heavily used
+
+This enhancement focuses on **Tier 2 (Swap)** to enable memory overcommit. CXL (Tier 1) support is planned as future work with different optimization strategies focused on capacity expansion rather than overcommit.
+
+### Memory Overcommit Need
 
 Operational data showed VMs typically utilize only ~20% of allocated RAM, leading to significant memory waste. Traditional 1:1 memory allocation prevented maximizing cluster density and made it impossible to meet common memory utilization target requirements of 70-80%.
 
@@ -97,7 +116,7 @@ This enhancement implements layered defense to enable overcommit while AVOIDING 
 
 5. **Swap (Secondary Memory Tier)**: Extends physical RAM with secondary storage (SSD/NVMe recommended). When physical memory exhausted, kernel moves pages to swap device. Swap is Tier 2 memory (~ms latency vs ~100ns for DRAM Tier 0).
 
-6. **MGLRU (Eviction Heuristic)**: Multi-Generational LRU algorithm intelligently selects WHICH pages to evict to swap. Targets cold pages (rarely accessed) for eviction while protecting hot pages (working set). Uses generational tracking and Bloom filters to prevent thrashing.
+6. **MGLRU (Node-level Memory Page Eviction Heuristic)**: Multi-Generational LRU algorithm running in the kernel at the node level, intelligently selecting WHICH memory pages to evict to swap. Targets cold pages (rarely accessed) for eviction while protecting hot pages (working set). Uses generational tracking and Bloom filters to prevent thrashing.
 
 **Goal**: Swap exists but should rarely be used. FPR + descheduler + KSM work together to keep memory available without swapping. When memory pressure cannot be avoided:
 - **Swap** provides the storage tier for evicted pages (extends physical memory)
@@ -123,13 +142,42 @@ The descheduler with KubeVirtRelieveAndMigrate strategy is REQUIRED for safe pro
 
 ### Workflow Description
 
-**cluster administrator** configures memory overcommit settings.
+#### Feature Enablement Evolution
 
-**virt-platform-autopilot** calculates optimal parameters.
+| Feature | 4.22 | 5.0 | Future |
+|---------|------|-----|--------|
+| **Free Page Reporting (FPR)** | Enabled by default | Enabled by default | Enabled by default |
+| **KSM Zero Pages** | Manual (annotation) | Autopilot | Autopilot |
+| **Memory Overcommit %** | Manual (spec field) | Autopilot calculates | Autopilot |
+| **MGLRU Parameters** | Autopilot | Autopilot | Autopilot |
+| **Descheduler Thresholds** | Manual (separate config) | Autopilot | Autopilot |
+| **Swap Configuration** | Manual (node-level) | Manual | Autopilot |
+| **virt-platform-autopilot** | Manual enable (annotation) | Enabled by default | Enabled by default |
 
-**descheduler** monitors pressure and rebalances VMs.
+**Trend**: Moving from manual configuration toward autopilot-managed optimization based on cluster characteristics. Autopilot enabled by default starting in 5.0.
 
 #### Enabling Memory Overcommit (Admin Workflow)
+
+**OpenShift 5.0+** (autopilot enabled by default):
+
+1. Autopilot automatically calculates and applies:
+   - MGLRU parameters (based on node memory, workload patterns)
+   - Memory overcommit percentage (default 20% at node level)
+   - Descheduler thresholds for pressure-based rebalancing
+   - Control group throttling limits
+
+2. Administrator optionally configures custom overcommit percentage:
+   ```bash
+   oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+     --type='merge' -p='{"spec":{"virtualization":{"memoryOvercommitPercentage":150}}}'
+   ```
+
+3. VMs automatically benefit from FPR (enabled by default):
+   - Guest OS reports free pages via virtio driver
+   - Hypervisor reclaims pages asynchronously
+   - No forced balloon inflation (unlike traditional ballooning)
+
+**OpenShift 4.22** (autopilot requires manual enablement):
 
 1. Administrator enables autopilot on HyperConverged resource:
    ```bash
@@ -137,22 +185,7 @@ The descheduler with KubeVirtRelieveAndMigrate strategy is REQUIRED for safe pro
      -n openshift-cnv platform.kubevirt.io/autopilot="true" --overwrite
    ```
 
-2. Autopilot calculates and applies:
-   - MGLRU parameters (based on node memory, workload patterns)
-   - Memory overcommit percentage (default 20% at node level)
-   - Descheduler thresholds for pressure-based rebalancing
-   - Control group throttling limits
-
-3. Administrator optionally configures custom overcommit percentage:
-   ```bash
-   oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv \
-     --type='merge' -p='{"spec":{"virtualization":{"memoryOvercommitPercentage":150}}}'
-   ```
-
-4. VMs automatically benefit from FPR (enabled by default):
-   - Guest OS reports free pages via virtio driver
-   - Hypervisor reclaims pages asynchronously
-   - No forced balloon inflation (unlike traditional ballooning)
+2. Follow steps from 5.0+ workflow above (autopilot calculates parameters, optional custom percentage, FPR enabled by default)
 
 #### Enabling KSM Zero Pages (Optional)
 
@@ -169,31 +202,31 @@ The descheduler with KubeVirtRelieveAndMigrate strategy is REQUIRED for safe pro
 
 #### Memory Pressure Response (Avoids Swapping)
 
-**Normal operation** (no pressure):
-1. FPR continuously reports unused pages → hypervisor reclaims
-2. KSM merges zero pages across VMs → reduces footprint
-3. Result: Overcommit achieved WITHOUT swap traffic
+| Feature | Normal (<70%) | Moderate (70-80%) | High (>80%) | Worst-case |
+|---------|---------------|-------------------|-------------|------------|
+| **FPR** | Continuously reports unused pages → hypervisor reclaims[^reclaim] | Continues reclaiming[^reclaim] | Continues reclaiming[^reclaim] | Continues reclaiming[^reclaim] |
+| **KSM Zero Pages** | Merges zero-filled pages across VMs → reduces footprint | Continues merging | Continues merging | Continues merging |
+| **Descheduler** | Monitors utilization metrics | Live-migrates[^migration] VMs from nodes trending upward | Switches to PSI metrics, aggressive migration[^migration], soft-taints saturated nodes (PreferNoSchedule) | Cannot keep up with pressure |
+| **MGLRU** | Inactive (no eviction[^eviction] needed) | Inactive (reclaim[^reclaim] sufficient) | Inactive (migration[^migration] sufficient) | Selects cold pages for eviction[^eviction] using generational tracking + Bloom filters |
+| **Swap** | Unused | Unused | Unused or minimal | Active - evicted[^eviction] pages stored in Tier 2 (graceful degradation, no OOM kills) |
 
-**Moderate pressure** (70-80% utilization):
-1. Descheduler monitors utilization metrics
-2. If trending upward: Live-migrate VMs to less-utilized nodes
-3. Rebalancing prevents pressure from building
-4. Result: Swap still NOT used
+[^reclaim]: **Reclamation**: Guest-cooperative process where VM reports unused memory pages to hypervisor via FPR. Pages returned to host without eviction or migration. See [virtio-balloon docs][virtio-balloon].
 
-**High pressure** (>80% utilization):
-1. Descheduler switches to PSI (Pressure Stall Information) metrics
-2. PSI detects when workloads START waiting for memory operations
-3. Aggressive live-migration from saturated nodes
-4. Soft-taint saturated nodes (PreferNoSchedule)
-5. Result: Swap minimally used or avoided entirely
+[^eviction]: **Eviction**: Kernel moving memory pages from DRAM (Tier 0) to swap device (Tier 2 secondary storage). MGLRU algorithm selects WHICH pages to evict based on access patterns. Pages moved to slower storage tier but VM continues running. See [MGLRU kernel docs][kernel-mglru].
 
-**Worst-case** (rebalancing cannot keep up):
-1. MGLRU tiers cold pages to swap (graceful degradation)
-2. Bloom filters prevent thrashing
-3. Swap traffic occurs but VM stays running (not OOM killed)
-4. Alerting triggers for operator intervention
+[^migration]: **Migration**: Live-migration of entire VM from one physical node to another node in the cluster. Descheduler orchestrates VM migration to balance memory load across cluster. VM memory contents transferred over network, not paged to disk. See [descheduler enhancement][descheduler-enhancement].
 
-**Goal**: Steps 1-3 should handle 99% of cases. Swap is safety net for step 4.
+**Goal**: Normal + Moderate + High pressure bands (first 3 columns) handle 99% of cases through reclamation[^reclaim] and rebalancing. Swap is safety net for worst-case column.
+
+**Result by pressure band**:
+- **Normal/Moderate**: Overcommit achieved WITHOUT swap traffic
+- **High**: Swap minimally used or avoided entirely via aggressive migration
+- **Worst-case**: Swap traffic occurs but VMs stay running; alerts trigger for operator intervention
+
+**Important - Swap Persistence**: Once pages are evicted to swap during a pressure event, they remain in swap even after pressure subsides. No component actively migrates swap pages back to DRAM. Cold pages only return to DRAM on demand (page fault when accessed). This means:
+- Swap utilization persists after pressure events until pages are accessed
+- Node reboot clears swap and returns all memory to DRAM
+- Monitoring swap usage over time reveals historical pressure patterns, not just current pressure
 
 ### API Extensions
 
@@ -208,16 +241,16 @@ metadata:
   name: kubevirt-hyperconverged
   namespace: openshift-cnv
   annotations:
-    # Enable autopilot for automated configuration
+    # Enable autopilot for automated configuration (4.22 only - enabled by default in 5.0+)
     platform.kubevirt.io/autopilot: "true"
     # Enable KSM zero-page merging
     platform.kubevirt.io/enable-ksm-zero-only: "true"
 spec:
   virtualization:
-    # Memory overcommit percentage (optional)
+    # Memory overcommit percentage (optional - autopilot calculates if not specified in 5.0+)
     # Formula: pod requests = VM guest * 100 / memoryOvercommitPercentage
     # Example: 150 means 12Gi VM requests 8Gi (12 * 100 / 150)
-    # Default: 100 (no overcommit unless explicitly set)
+    # Default: 100 (no overcommit) in 4.22; autopilot-calculated in 5.0+
     memoryOvercommitPercentage: 150
     
     # KSM configuration (alternative to annotation)
@@ -230,10 +263,19 @@ spec:
 
 **Behavior**:
 
-- **autopilot annotation**: Enables virt-platform-autopilot to configure MGLRU, descheduler, limits
-- **memoryOvercommitPercentage**: Reduces pod requests; scheduler can pack more VMs per node
+- **autopilot annotation**: 
+  - 4.22: Must be set to `"true"` to enable virt-platform-autopilot
+  - 5.0+: Enabled by default; annotation only needed to disable (`"false"`)
+  - Configures: MGLRU parameters, descheduler thresholds, memory limits
+- **memoryOvercommitPercentage**: 
+  - Reduces pod requests; scheduler can pack more VMs per node
+  - 4.22: Manual configuration required
+  - 5.0+: Autopilot calculates optimal value if not explicitly set
 - **FPR**: Enabled by default for all VMs (no configuration needed)
-- **KSM zero-only**: Merges zero-filled pages; guest-agnostic, secure
+- **KSM zero-only**: 
+  - 4.22: Manual annotation required
+  - 5.0+: Managed by autopilot
+  - Merges zero-filled pages; guest-agnostic, secure
 
 ### Topology Considerations
 
@@ -300,6 +342,8 @@ Not applicable. OKE does not include OpenShift Virtualization.
 
 **Basic Mechanism**: Extends physical RAM with secondary storage.
 
+**Kubernetes Integration**: Enabled via [KEP-2400: Node Memory Swap Support][kep-2400], which provides native swap support in Kubernetes (alpha in 1.22, GA in 1.34). OpenShift 4.18+ includes this capability.
+
 **How Swap Works**:
 - Kernel moves pages from DRAM (Tier 0) to disk/SSD (Tier 2)
 - Frees physical RAM for other uses
@@ -320,13 +364,21 @@ Not applicable. OKE does not include OpenShift Virtualization.
 - Shared across all VMs on that node
 - Size typically 1-2x node physical RAM
 
-#### MGLRU - Intelligent Eviction Heuristic
+**Swap Persistence Behavior**:
+- Pages evicted to swap during pressure events remain in swap after pressure subsides
+- No active swap-to-DRAM migration mechanism exists
+- Pages return to DRAM only on-demand when accessed (page fault triggers swapin)
+- This means swap utilization reflects historical peak pressure, not current pressure
+- Node reboot clears all swap and returns memory to DRAM
+- Monitoring: Persistent swap usage indicates past pressure events; use PSI metrics for current pressure
 
-**Default since OpenShift 4.18**. Multi-Generational LRU (MGLRU) replaces legacy active/inactive LRU, providing intelligent selection of WHICH pages to evict to swap.
+#### MGLRU - Node-level Memory Page Eviction Heuristic
+
+**Default since OpenShift 4.18**. Multi-Generational LRU (MGLRU) is a kernel-level algorithm running on each node, providing intelligent selection of WHICH memory pages to evict to swap.
 
 **MGLRU vs Swap - Distinct Roles**:
 - **Swap** = WHERE evicted pages go (secondary storage tier)
-- **MGLRU** = WHICH pages to evict (selection heuristic)
+- **MGLRU** = WHICH memory pages to evict at the node level (kernel selection algorithm)
 - Together: Intelligent swap that minimizes performance impact
 
 **Why MGLRU is Better**:
@@ -426,13 +478,15 @@ oc annotate hyperconverged kubevirt-hyperconverged \
 - Descheduler thresholds (when to trigger rebalancing)
 - Control group throttling limits
 
-**Activation**:
-```bash
-oc annotate hyperconverged kubevirt-hyperconverged \
-  -n openshift-cnv platform.kubevirt.io/autopilot="true"
-```
+**Enablement**:
+- 5.0+: Enabled by default; no action required
+- 4.22: Manual activation via annotation:
+  ```bash
+  oc annotate hyperconverged kubevirt-hyperconverged \
+    -n openshift-cnv platform.kubevirt.io/autopilot="true"
+  ```
 
-**Deactivation** (does not disable already-configured features):
+**Deactivation** (5.0+ only, does not disable already-configured features):
 ```bash
 oc annotate hyperconverged kubevirt-hyperconverged \
   -n openshift-cnv platform.kubevirt.io/autopilot="false"
@@ -481,11 +535,14 @@ Increased complexity. Swap I/O slower than RAM. Autopilot calculations opaque. P
 
 ### Alternative 1: WASP
 
-Deprecated in favor of MGLRU. WASP was a dedicated swap component. MGLRU provides:
-- Better integration with Kubernetes cgroups
-- Per-VM tracking and accounting
-- Bloom filter thrashing prevention
-- Lower CPU overhead
+Deprecated in favor of Kubernetes native swap support. WASP (Workload-Aware Swap Provisioning) was an alternative Kubernetes integration mechanism for swap. Replaced by upstream Kubernetes swap support via [KEP-2400: Node Memory Swap Support][kep-2400] (alpha in Kubernetes 1.22, GA in Kubernetes 1.34, available in OpenShift 4.18+).
+
+Kubernetes native swap (KEP-2400) provides:
+- Standardized upstream integration with Kubernetes cgroups v2
+- Better compatibility with Kubernetes memory management
+- Direct support in kubelet without additional components
+- LimitedSwap mode: Burstable QoS pods get proportional swap access; Guaranteed/BestEffort pods get zero swap
+- Aligned with upstream Kubernetes roadmap
 
 ### Alternative 2: Traditional Balloon Inflation
 
@@ -513,7 +570,7 @@ None. Implementation completed in OpenShift 4.18-4.22.
 
 ## Test Plan
 
-Tested across OpenShift 4.17 → 4.18 (MGLRU) → 4.22 (Autopilot, KSM zero).
+Tested across OpenShift 4.17 → 4.18 (MGLRU) → 4.22 (Autopilot, KSM zero) → 5.0 (Autopilot by default).
 
 ### Unit Tests
 
@@ -812,6 +869,12 @@ No additional infrastructure. Uses existing:
 - [Memory Monitoring Rules Reference][memory-rules-md] - Detailed explanation of memory metrics, thresholds, and monitoring strategies
 - [Memory Monitoring Rules (YAML)][memory-rules] - Prometheus recording rules for memory tier tracking, VM metrics, and cluster-wide monitoring
 
+### Upstream Documentation
+
+- [KEP-2400: Node Memory Swap Support][kep-2400] - Kubernetes Enhancement Proposal for native swap support (alpha in 1.22, GA in 1.34)
+- [MGLRU (Multi-Generational LRU)][kernel-mglru] - Kernel documentation on MGLRU memory page eviction algorithm
+- [virtio-balloon Free Page Reporting][virtio-balloon] - Kernel documentation on free page reporting mechanism
+
 ### Related Enhancements
 
 - [Load-aware VM Rebalancing through Descheduler](/enhancements/scheduling/load-aware-vm-rebalancing-through-descheduler.md) - Descheduler integration with PSI metrics
@@ -820,3 +883,6 @@ No additional infrastructure. Uses existing:
 [rh-article-2026]: https://developers.redhat.com/articles/2026/10/15/red-hat-openshift-virtualization-memory-management-overview
 [memory-rules-md]: https://github.com/fabiand/perses-dashboards/blob/main/rules/memory.md
 [memory-rules]: https://github.com/fabiand/perses-dashboards/blob/main/rules/memory.yaml
+[kep-2400]: https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2400-node-swap
+[kernel-mglru]: https://docs.kernel.org/mm/multigen_lru.html
+[virtio-balloon]: https://docs.kernel.org/mm/free_page_reporting.html
